@@ -19,6 +19,13 @@ from pathlib import Path
 from . import config as cfg
 from . import database as db
 from . import hyper_coins
+from .agent_market import (
+    AgentMarketError,
+    get_open_positions,
+    get_scope_balance,
+    inspect_agent,
+    persist_report,
+)
 from .logger_setup import setup_logger
 from .agent_protocol_reporter import run_agent_protocol_reporter
 from .balance_tracker import run_balance_tracker, run_sltp_checker
@@ -26,7 +33,7 @@ from .hyper_coins import run_hyper_coin_refresher
 from .moss_poller import run_moss_poller
 from .moss_reporter import run_moss_reporter
 from .moss_ws import run_moss_ws
-from .preflight import check_authorization
+from .preflight import check_account_abstraction, check_authorization
 
 
 logger = setup_logger()
@@ -163,6 +170,11 @@ def cmd_start() -> None:
     else:
         logger.info("allowed_coins is empty; Hyper coin cache is authoritative")
 
+    if not check_account_abstraction(raise_on_fail=False):
+        logger.error("Service startup aborted: unsupported account abstraction")
+        print("ERROR: 当前账户模式不受支持，服务未启动；请切换到手动(标准)模式后重试。")
+        sys.exit(1)
+
     # Fail fast: 未授权时启动只会持续下单失败，直接阻塞启动并让用户先修配置/授权。
     if not check_authorization(raise_on_fail=False):
         logger.error("Service startup aborted: authorization check failed")
@@ -177,6 +189,45 @@ def cmd_start() -> None:
         logger.error("Service startup aborted: cannot refresh Hyper coin cache: %s", e)
         print("ERROR: 无法获取 Hyperliquid 支持币种列表，请检查网络或 hl_api_url，服务未启动。")
         sys.exit(1)
+
+    if moss_cfg.get("enabled"):
+        try:
+            market = inspect_agent(agent_id, persist=False, refresh_cache=False)
+            scope_agent = str(moss_cfg.get("market_scope_agent_id") or "")
+            is_new_selection = scope_agent not in {"", agent_id} or (
+                not scope_agent and not db.has_baseline(agent_id)
+            )
+            if is_new_selection:
+                remaining = get_open_positions()
+                if remaining:
+                    raise AgentMarketError(
+                        "选择新 Agent 前必须关闭全部老持仓；仍有仓位: "
+                        + ", ".join(sorted(remaining))
+                    )
+            persist_report(market)
+            logger.info(
+                "Agent market validated: agent=%s scope=%s fills=%d symbols=%s",
+                market.agent_id, market.market_scope, market.sample_size, market.symbols,
+            )
+            print(
+                f"Agent 类型验证通过: scope={market.market_scope}, "
+                f"最近成交={market.sample_size}, symbols={','.join(market.symbols)}"
+            )
+            balance = get_scope_balance(market.market_scope)
+            if balance["account_value"] <= 0:
+                target = "xyz dex" if market.market_scope == "xyz" else "默认 Perps"
+                raise AgentMarketError(
+                    f"{target} 没有跟单资金；请先运行 funds show，"
+                    "确认后将旧账户的 withdrawable 划入目标账户"
+                )
+            print(
+                f"目标账户资金: accountValue={balance['account_value']:.4f}, "
+                f"withdrawable={balance['withdrawable']:.4f} USDC"
+            )
+        except AgentMarketError as e:
+            logger.error("Service startup aborted: Agent market validation failed: %s", e)
+            print(f"ERROR: Agent 历史验证失败，服务未启动: {e}")
+            sys.exit(1)
 
     proc = _spawn_service_process(config_path)
     _write_pid(proc.pid)

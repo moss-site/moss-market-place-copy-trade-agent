@@ -2,9 +2,10 @@
 启动前和下单前的授权校验。
 
 检查项：
-1. main_address 是否已将 wallet_address 授权为 Agent（userRole/extraAgents）
-2. standard 模式：main_address 是否已授权 builder_address（approvedBuilders）
-3. contract_agent 模式：仍校验 wallet_address 的 agent 归属，但跳过 builder 授权
+1. main_address 是否使用手动（标准）账户模式
+2. main_address 是否已将 wallet_address 授权为 Agent（userRole/extraAgents）
+3. standard 模式：main_address 是否已授权 builder_address（approvedBuilders）
+4. contract_agent 模式：仍校验 wallet_address 的 agent 归属，但跳过 builder 授权
 """
 
 import logging
@@ -16,8 +17,13 @@ from . import config as cfg
 logger = logging.getLogger("follow_agent.preflight")
 _EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 
+_ACCOUNT_ABSTRACTION_LABELS = {
+    "unifiedAccount": "统一账户",
+    "portfolioMargin": "投资组合保证金",
+}
 
-def _post_info(api_url: str, payload: dict) -> list | dict:
+
+def _post_info(api_url: str, payload: dict) -> list | dict | str:
     import requests
 
     r = requests.post(f"{api_url}/info", json=payload, timeout=10)
@@ -94,6 +100,63 @@ def _validate_config_completeness(
     except (TypeError, ValueError):
         errors.append("agent_protocol_report.chain_id 必须是正整数。")
         logger.error(errors[-1])
+
+
+def _normalize_account_abstraction(response: object) -> str:
+    """兼容 info 端点的新旧响应；未知或缺字段按手动（标准）模式处理。"""
+    if isinstance(response, str):
+        mode = response
+    elif isinstance(response, dict):
+        mode = (
+            response.get("abstraction")
+            or response.get("mode")
+            or response.get("userAbstraction")
+        )
+    else:
+        mode = None
+    return mode if mode in _ACCOUNT_ABSTRACTION_LABELS else "disabled"
+
+
+def get_account_abstraction() -> str:
+    """查询当前账户抽象模式；缺字段兼容为手动（标准）模式。"""
+    api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+    account = (cfg.get("main_address", "") or cfg.get("wallet_address", "")).lower()
+    if not account:
+        raise ValueError("账户地址未配置")
+    response = _post_info(
+        api_url,
+        {"type": "userAbstraction", "user": account},
+    )
+    return _normalize_account_abstraction(response)
+
+
+def check_account_abstraction(raise_on_fail: bool = True) -> bool:
+    """阻断统一账户/投资组合保证金模式；查询异常仅 warning 并放行。"""
+    account = (cfg.get("main_address", "") or cfg.get("wallet_address", "")).lower()
+    if not account:
+        logger.warning("账户地址未配置，跳过账户模式查询")
+        return True
+
+    try:
+        mode = get_account_abstraction()
+    except Exception as e:
+        logger.warning("账户模式查询失败，按手动(标准)模式继续启动: %s", e)
+        return True
+
+    label = _ACCOUNT_ABSTRACTION_LABELS.get(mode)
+    if label:
+        msg = (
+            f"当前账户为{label}模式，跟单服务要求手动(标准)模式；"
+            "请在 Hyperliquid 设置切换，或用 SDK "
+            'userSetAbstraction(user, "disabled") 切换'
+        )
+        logger.error(msg)
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        return False
+
+    logger.info("Account abstraction OK: account=%s mode=%s", account[:10], mode)
+    return True
 
 
 def check_authorization(raise_on_fail: bool = True) -> bool:

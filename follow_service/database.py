@@ -298,6 +298,15 @@ def get_baselines_list(agent_address: str) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+def get_all_baseline_coins() -> list[str]:
+    """返回所有 Agent 基线中出现过的 coin，供 relevant dex 选择使用。"""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT coin FROM agent_baseline ORDER BY coin"
+        ).fetchall()
+        return [str(r["coin"]) for r in rows]
+
+
 def clear_baselines(agent_address: str) -> None:
     """删除某 agent 的所有基线记录。"""
     with get_conn() as conn:
@@ -525,8 +534,8 @@ def get_earliest_pending_moss_fill_created_at() -> Optional[str]:
     return min(timestamps) if timestamps else None
 
 
-def moss_fill_cursor_with_overlap(cursor: str, overlap_seconds: int = 5) -> str:
-    """将服务端 cursor 回退几秒，避免同秒多 fill 或 API 边界语义导致漏拉。"""
+def moss_fill_cursor_with_overlap(cursor: str, overlap_seconds: int = 30) -> str:
+    """将服务端 cursor 回退固定 overlap，默认 30 秒。"""
     try:
         dt = datetime.fromisoformat(cursor.replace("Z", "+00:00"))
     except ValueError:

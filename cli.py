@@ -24,6 +24,7 @@ Multi-instance:
 
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -37,11 +38,14 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+from eth_account import Account
+
 # Allow running from any directory
 sys.path.insert(0, str(Path(__file__).parent))
 
 from follow_service import config as cfg
 from follow_service import database as db
+from follow_service import hyper_coins, preflight, trader
 
 
 DEFAULT_LOCAL_VERSION = "0.1.1"
@@ -74,6 +78,296 @@ def _print_table(rows: list[dict], keys: list[str]) -> None:
     print("-" * len(header))
     for r in rows:
         print("  ".join(str(r.get(k, "")).ljust(widths[k]) for k in keys))
+
+
+def _funds_account_address() -> str:
+    address = cfg.get("main_address", "") or cfg.get("wallet_address", "")
+    if not address:
+        print("ERROR: main_address 和 wallet_address 均未配置")
+        raise SystemExit(1)
+    return str(address).lower()
+
+
+def _validated_agent_funds_account() -> str:
+    """Return the main account only when this key is its currently approved Agent."""
+    main_address = str(cfg.get("main_address", "")).lower()
+    wallet_address = str(cfg.get("wallet_address", "")).lower()
+    private_key = str(cfg.get("private_key", ""))
+    if not main_address:
+        print("ERROR: Agent DEX 划转必须配置 main_address")
+        raise SystemExit(1)
+    if not re.fullmatch(r"0x[0-9a-f]{40}", main_address):
+        print("ERROR: main_address 格式无效")
+        raise SystemExit(1)
+    try:
+        signer_address = Account.from_key(private_key).address.lower()
+    except Exception:
+        print("ERROR: private_key 无效，无法执行 Agent DEX 划转")
+        raise SystemExit(1)
+    if not wallet_address or signer_address != wallet_address:
+        print("ERROR: private_key 推导地址与 wallet_address 不一致，拒绝资金划转")
+        raise SystemExit(1)
+
+    api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+    try:
+        role = preflight._post_info(api_url, {"type": "userRole", "user": signer_address})
+    except Exception as exc:
+        print(f"ERROR: Agent 主账户归属查询失败: {_safe_exchange_error(exc)}")
+        raise SystemExit(1)
+    bound_user = role.get("data", {}).get("user", "") if isinstance(role, dict) else ""
+    if not (
+        isinstance(role, dict)
+        and role.get("role") == "agent"
+        and str(bound_user).lower() == main_address
+    ):
+        print("ERROR: 当前 wallet_address 不是该 main_address 的有效 Agent，拒绝资金划转")
+        raise SystemExit(1)
+    return main_address
+
+
+def _parse_transfer_amount(raw: str) -> float:
+    try:
+        amount = float(raw)
+    except (TypeError, ValueError):
+        print(f"ERROR: 无效金额: {raw}")
+        raise SystemExit(1)
+    if not math.isfinite(amount) or amount <= 0:
+        print("ERROR: 划转金额必须是大于 0 的有限数字")
+        raise SystemExit(1)
+    return amount
+
+
+def _build_funds_exchange():
+    exchange, _ = trader._build_clients()
+    return exchange
+
+
+def _exchange_error(result: object) -> str | None:
+    if not isinstance(result, dict):
+        return "Hyperliquid API 返回了无法识别的响应"
+    status = str(result.get("status", "")).lower()
+    if status in {"err", "error", "failed", "failure"}:
+        return str(result.get("response") or result.get("error") or "Hyperliquid API 拒绝操作")
+    if result.get("error"):
+        return str(result["error"])
+    response = result.get("response")
+    if isinstance(response, dict) and response.get("error"):
+        return str(response["error"])
+    if status != "ok":
+        return str(result.get("response") or "Hyperliquid API 未确认操作成功")
+    return None
+
+
+def _safe_exchange_error(reason: object) -> str:
+    text = str(reason)
+    private_key = str(cfg.get("private_key", ""))
+    if private_key:
+        text = text.replace(private_key, "[REDACTED]")
+    text = re.sub(r"0x[0-9a-fA-F]{64,}", "[REDACTED]", text)
+    return text[:300]
+
+
+def _signed_action_fallback(operation: str, dex: str = "") -> None:
+    if operation == "dex":
+        print("ERROR: Agent DEX 划转失败；请检查 Agent 授权、主账户绑定和可划转余额。")
+        print(f"Hyperliquid UI 兜底：打开 {dex} dex 对应市场，使用 Transfer/划转保证金。")
+        return
+
+    print("ERROR: 操作失败；该操作需主钱包签名，当前配置通常是 Agent Wallet。")
+    if operation == "spot-perp":
+        print("Hyperliquid UI 兜底：Portfolio → Transfer，在 Spot 与 Perps 间划转。")
+    elif operation == "account-mode":
+        print("Hyperliquid UI 兜底：设置 → 账户类型，切换到手动（标准）模式。")
+        print("若 Hyperliquid 返回 Abstraction transition not allowed，请用主钱包在 UI 完成账户模式切换。")
+    else:
+        print("Hyperliquid UI 兜底：请在对应页面完成操作。")
+
+
+def _run_signed_action(action, *, operation: str, dex: str = "") -> object:
+    try:
+        result = action()
+        reason = _exchange_error(result)
+    except Exception as exc:
+        reason = str(exc)
+        result = None
+    if reason:
+        print(f"Hyperliquid 返回: {_safe_exchange_error(reason)}")
+        _signed_action_fallback(operation, dex)
+        raise SystemExit(1)
+    return result
+
+
+def _number(value: object) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _show_funds() -> None:
+    snapshot = _funds_snapshot()
+    print(f"Spot USDC: {snapshot['spot']:.4f}")
+    for dex, values in snapshot["perp"].items():
+        label = f"{dex} dex" if dex else "默认 Perps"
+        print(
+            f"{label}: accountValue={values['account_value']:.4f} "
+            f"withdrawable={values['withdrawable']:.4f}"
+        )
+
+
+def _funds_snapshot(dexes: list[str] | None = None) -> dict:
+    """Return Spot and per-DEX balances without constructing a signing client."""
+    account = _funds_account_address()
+    api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+    spot_state = preflight._post_info(
+        api_url,
+        {"type": "spotClearinghouseState", "user": account},
+    )
+    spot_usdc = 0.0
+    if isinstance(spot_state, dict):
+        for balance in spot_state.get("balances", []) or []:
+            if isinstance(balance, dict) and balance.get("coin") == "USDC":
+                spot_usdc = _number(balance.get("total"))
+                break
+    perp: dict[str, dict[str, float]] = {}
+    selected_dexes = dexes if dexes is not None else trader._get_relevant_dexes()
+    for dex in selected_dexes:
+        payload = {"type": "clearinghouseState", "user": account}
+        if dex:
+            payload["dex"] = dex
+        state = preflight._post_info(api_url, payload)
+        state = state if isinstance(state, dict) else {}
+        summary = state.get("marginSummary", {})
+        summary = summary if isinstance(summary, dict) else {}
+        account_value = _number(summary.get("accountValue"))
+        withdrawable = _number(state.get("withdrawable"))
+        perp[dex] = {
+            "account_value": account_value,
+            "withdrawable": withdrawable,
+        }
+    return {"spot": spot_usdc, "perp": perp}
+
+
+def _spot_token_name(token: str = "USDC") -> str:
+    api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+    spot_meta = trader._get_spot_meta(api_url)
+    for item in spot_meta.get("tokens", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("name") or "").upper() == token.upper():
+            token_id = str(item.get("tokenId") or "").strip()
+            if token_id:
+                return f"{token}:{token_id}"
+    raise SystemExit(f"ERROR: 未在 Hyperliquid spotMeta 中找到 {token} tokenId")
+
+
+def cmd_funds(args: list[str]) -> None:
+    subcommand = args[0] if args else "show"
+    if subcommand == "show" and len(args) <= 1:
+        _show_funds()
+        return
+
+    if subcommand in {"spot-to-perp", "perp-to-spot"} and len(args) == 2:
+        amount = _parse_transfer_amount(args[1])
+        account = _validated_agent_funds_account()
+        exchange = _build_funds_exchange()
+        if str(exchange.account_address or "").lower() != account:
+            print("ERROR: Exchange 目标账户与已验证 main_address 不一致，拒绝资金划转")
+            raise SystemExit(1)
+        to_perp = subcommand == "spot-to-perp"
+        _run_signed_action(
+            lambda: trader.agent_send_asset(
+                exchange,
+                source_dex="spot" if to_perp else "",
+                destination_dex="" if to_perp else "spot",
+                token=_spot_token_name("USDC"),
+                amount=amount,
+            ),
+            operation="spot-perp",
+        )
+        direction = "Spot → Perps" if to_perp else "Perps → Spot"
+        print(f"划转成功: {direction} {amount:g} USDC")
+        return
+
+    if subcommand in {"to-dex", "from-dex"} and len(args) == 3:
+        dex = args[1].strip()
+        available_dexes = set(hyper_coins.get_perp_dexs())
+        if not dex or dex not in available_dexes:
+            print(f"ERROR: {dex or '(空)'} 不是有效的 Hyperliquid perp dex")
+            raise SystemExit(1)
+        amount = _parse_transfer_amount(args[2])
+        account = _validated_agent_funds_account()
+        exchange = _build_funds_exchange()
+        if str(exchange.account_address or "").lower() != account:
+            print("ERROR: Exchange 目标账户与已验证 main_address 不一致，拒绝资金划转")
+            raise SystemExit(1)
+        to_dex = subcommand == "to-dex"
+        source_dex = "" if to_dex else dex
+        destination_dex = dex if to_dex else ""
+        try:
+            account_mode = preflight.get_account_abstraction()
+        except Exception:
+            account_mode = "disabled"
+        if account_mode == "unifiedAccount":
+            print("ERROR: 当前账户是 unifiedAccount，Agent DEX 划转返回 ok 但不会形成独立 builder dex 保证金。")
+            print("请先用主钱包在 Hyperliquid UI 将账户类型切换为手动（标准）模式，再执行资金划转。")
+            raise SystemExit(1)
+        token = _spot_token_name("USDC") if "spot" in {source_dex, destination_dex} else "USDC"
+        _run_signed_action(
+            lambda: trader.agent_send_asset(
+                exchange,
+                source_dex=source_dex,
+                destination_dex=destination_dex,
+                token=token,
+                amount=amount,
+            ),
+            operation="dex",
+            dex=dex,
+        )
+        def _dex_label(value: str) -> str:
+            if value == "spot":
+                return "Spot"
+            return f"{value} dex" if value else "默认 Perps"
+
+        direction = f"{_dex_label(source_dex)} → {_dex_label(destination_dex)}"
+        print(f"划转成功: {direction} {amount:g} USDC")
+        return
+
+    print(
+        "Usage: funds <show|spot-to-perp AMOUNT|perp-to-spot AMOUNT|"
+        "to-dex DEX AMOUNT|from-dex DEX AMOUNT>"
+    )
+    raise SystemExit(1)
+
+
+def cmd_account_mode(args: list[str]) -> None:
+    subcommand = args[0] if args else "show"
+    if subcommand == "show" and len(args) <= 1:
+        try:
+            mode = preflight.get_account_abstraction()
+        except Exception as exc:
+            print(f"ERROR: 账户模式查询失败: {exc}")
+            raise SystemExit(1)
+        print(f"当前账户模式: {mode}")
+        return
+
+    if subcommand == "set-manual" and all(arg == "--yes" for arg in args[1:]):
+        if "--yes" not in args[1:]:
+            answer = input("确认将账户切换为手动（标准）模式？输入 yes 继续: ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("已取消")
+                return
+        account = _funds_account_address()
+        exchange = _build_funds_exchange()
+        _run_signed_action(
+            lambda: exchange.user_set_abstraction(account, "disabled"),
+            operation="account-mode",
+        )
+        print("账户已切换为手动（标准）模式")
+        return
+
+    print("Usage: account-mode <show|set-manual [--yes]>")
+    raise SystemExit(1)
 
 
 # ─── commands ─────────────────────────────────────────────────────────────────
@@ -187,7 +481,7 @@ def cmd_service(args: list[str]) -> None:
     elif subcmd == "resume":
         cmd_service_resume()
     elif subcmd == "switch":
-        cmd_service_switch()
+        cmd_service_switch(args[1:])
     elif subcmd == "start":
         _require_risk_params_confirmed()
         _set_service_desired_state("running")
@@ -199,14 +493,33 @@ def cmd_service(args: list[str]) -> None:
         _run_service(subcmd)
 
 
+def _wait_until_flat(attempts: int = 5) -> dict:
+    """Wait for API state convergence and return any remaining positions."""
+    account = _funds_account_address()
+    remaining: dict = {}
+    for attempt in range(attempts):
+        remaining = trader.get_current_positions(account).get("positions", {})
+        if not remaining:
+            return {}
+        if attempt + 1 < attempts:
+            time.sleep(1)
+    return remaining
+
+
 def cmd_service_pause() -> None:
-    """暂停跟单：全平仓 + 停服务 + 清基线。"""
+    """暂停跟单：先停信号，再全平并确认归零，最后清基线。"""
     _set_service_desired_state("paused")
     from follow_service.trader import close_all_positions
     from follow_service.moss_reporter import flush_trade_reports_once
     from follow_service.agent_protocol_reporter import flush_agent_protocol_reports_once
 
     db.init_db()
+
+    print("正在停止服务，防止平仓期间继续接收新信号...")
+    _run_service("stop")
+    if not _wait_for_service_stopped():
+        print("ERROR: 服务在 30 秒内未停止；为避免新信号与平仓竞态，本次未执行平仓。")
+        raise SystemExit(1)
 
     # 1. 全平仓
     print("正在平仓所有持仓...")
@@ -217,6 +530,13 @@ def cmd_service_pause() -> None:
             print(f"  {r['coin']} {r['side']} size={r['size']:.6f} status={r['status']} {pnl_str}")
     else:
         print("  无持仓需要平仓")
+
+    remaining = _wait_until_flat()
+    if remaining:
+        coins = ", ".join(sorted(remaining))
+        print(f"ERROR: 仍有未平仓仓位: {coins}；未清除基线，请人工处理后重试。")
+        raise SystemExit(1)
+    print("已确认所有持仓为 0。")
 
     # 1.5 先同步 flush 一次 pending trade reports，避免 close_all 后立刻 stop 导致上报长期停在 pending
     try:
@@ -233,11 +553,7 @@ def cmd_service_pause() -> None:
     except Exception as exc:
         print(f"WARNING: pending Agent Protocol Report flush failed before stop: {exc}")
 
-    # 2. 停服务
-    print("正在停止服务...")
-    _run_service("stop")
-
-    # 3. 清基线
+    # 2. 只有确认全平后才清基线。
     moss_cfg = cfg.get_moss_source_config()
     agent_id = moss_cfg.get("agent_id", "")
     if agent_id:
@@ -256,15 +572,65 @@ def cmd_service_resume() -> None:
     print("服务已启动，基线将自动重建。")
 
 
-def cmd_service_switch() -> None:
-    """切换 Agent：暂停 + 提示配置新 agent_id。"""
+def cmd_service_switch(args: list[str]) -> None:
+    """Validate a new Agent, flatten the old one, then prepare fund migration."""
+    if not args:
+        print("Usage: service switch <NEW_AGENT_ID>")
+        raise SystemExit(1)
+
+    from follow_service.agent_market import AgentMarketError, inspect_agent, persist_report
+
+    new_agent = args[0].strip()
+    if not new_agent.startswith("agt_"):
+        print(f"ERROR: 无效 Agent ID: {new_agent}")
+        raise SystemExit(1)
+    current_cfg = cfg.get_moss_source_config()
+    old_agent = str(current_cfg.get("agent_id") or "")
+    old_scope = str(current_cfg.get("market_scope") or "")
+    if old_agent == new_agent:
+        print("新 Agent 与当前 Agent 相同，无需切换。")
+        return
+
+    try:
+        if old_agent and not old_scope:
+            old_scope = inspect_agent(old_agent, persist=False).market_scope
+        report = inspect_agent(new_agent, persist=False)
+    except (AgentMarketError, RuntimeError) as exc:
+        print(f"ERROR: 新 Agent 历史验证失败，未切换: {exc}")
+        raise SystemExit(1)
+
+    print(
+        f"新 Agent 验证通过: {new_agent}, scope={report.market_scope}, "
+        f"最近成交={report.sample_size}, symbols={','.join(report.symbols)}"
+    )
     cmd_service_pause()
-    print()
-    print("请配置新的 Agent:")
-    print(f"  方式 1: 编辑 {cfg.get_config_path()} 中 moss_source.agent_id")
-    print(f"  方式 2: python cli.py --config {cfg.get_config_path()} config set moss_source '{{...}}'")
-    print()
-    print(f"配置完成后，运行 'python cli.py --config {cfg.get_config_path()} service resume' 恢复跟单。")
+    persist_report(report, set_agent_id=True)
+    print(f"已切换配置: {old_agent or '(无)'} → {new_agent}")
+
+    if old_scope and old_scope != report.market_scope:
+        snapshot = _funds_snapshot(["", "xyz"])
+        source_dex = "xyz" if old_scope == "xyz" else ""
+        target_dex = "xyz" if report.market_scope == "xyz" else ""
+        source = snapshot["perp"].get(source_dex, {})
+        raw_withdrawable = max(float(source.get("withdrawable", 0)), 0.0)
+        amount = math.floor(raw_withdrawable * 1_000_000) / 1_000_000
+        source_label = "xyz" if source_dex else "默认 Perps"
+        target_label = "xyz" if target_dex else "默认 Perps"
+        print(
+            f"账户类型发生变化: {source_label} → {target_label}；"
+            f"来源 accountValue={float(source.get('account_value', 0)):.4f}, "
+            f"可划转 withdrawable={amount:.4f} USDC。"
+        )
+        if amount > 0:
+            transfer = "to-dex xyz" if target_dex == "xyz" else "from-dex xyz"
+            print("请向用户展示上述准确金额并取得确认；确认后执行：")
+            print(f"  .venv/bin/python cli.py --config {cfg.get_config_path()} funds {transfer} {amount:.6f}")
+        else:
+            print(f"WARNING: {source_label} 没有可划转资金，请先准备 {target_label} 跟单资金。")
+    else:
+        print("新旧 Agent 使用同一账户，无需迁移资金。")
+
+    print(f"资金确认到账后，运行 'python cli.py --config {cfg.get_config_path()} service resume'。")
 
 
 def _watchdog_interval_arg(args: list[str]) -> int:
@@ -459,6 +825,16 @@ def cmd_config_init_contract_agent(args: list[str]) -> None:
     except OSError:
         pass
 
+    previous_config_path = cfg.get_config_path()
+    try:
+        cfg.set_config_path(config_path)
+        coin_cache = hyper_coins.refresh_supported_coins(force=True)
+        print(f"Hyperliquid 支持合约列表已刷新: {len(coin_cache.get('coins') or [])} coins")
+    except Exception as exc:
+        print(f"WARNING: Hyperliquid 支持合约列表刷新失败，稍后 moss inspect/service start 会重试: {exc}")
+    finally:
+        cfg.set_config_path(previous_config_path)
+
     print(f"contract-agent 配置已创建：{config_path}")
     print(f"  network       : {network}")
     print(f"  executor      : {executor}")
@@ -578,6 +954,15 @@ def cmd_config_set(args: list[str]) -> None:
         parsed = value
 
     cfg.set_value(key, parsed)
+    if key == "moss_source.agent_id":
+        for field, empty in {
+            "market_scope": "",
+            "market_scope_agent_id": "",
+            "market_scope_sample_size": 0,
+            "market_scope_symbols": [],
+            "market_scope_checked_at": "",
+        }.items():
+            cfg.set_value(f"moss_source.{field}", empty)
     if key in _RISK_PARAM_KEYS:
         cfg.set_value("risk_params_confirmed", False)
         print(
@@ -958,6 +1343,21 @@ def cmd_moss_register() -> None:
         print(f"OK: follower_id={result.get('follower_id')} status={result.get('status')}")
     except Exception as e:
         print(f"ERROR: {e}")
+
+
+def cmd_moss_inspect(args: list[str]) -> None:
+    """Validate up to 20 recent fills and report the Agent's single market scope."""
+    from follow_service.agent_market import AgentMarketError, inspect_agent
+
+    persist = _has_flag(args, "--persist")
+    positional = [arg for arg in args if arg != "--persist"]
+    agent_id = positional[0].strip() if positional else None
+    try:
+        report = inspect_agent(agent_id, persist=persist)
+    except AgentMarketError as exc:
+        print(f"ERROR: Agent 历史验证失败: {exc}")
+        raise SystemExit(1)
+    print(json.dumps(report.to_dict(), ensure_ascii=False, indent=2))
 
 
 # ─── update commands ──────────────────────────────────────────────────────────
@@ -1662,7 +2062,7 @@ Commands:
   service status                        Check service status
   service pause                         Pause: close all positions + stop service
   service resume                        Resume: restart service (rebuild baseline)
-  service switch                        Switch Agent: pause + prompt for new agent_id
+  service switch <NEW_AGENT_ID>         Validate history, flatten old positions, switch
   service watchdog install [--interval N]
                                         Install OS-backed auto-restart watchdog
   service watchdog uninstall            Uninstall auto-restart watchdog
@@ -1670,6 +2070,7 @@ Commands:
   service watchdog enable|disable       Enable or disable automatic restart
   service watchdog check                Run one watchdog health check
   moss register                         Register as Moss follower (wallet signature)
+  moss inspect [AGENT_ID]               Classify latest 20 fills as default or xyz
   alerts list [--unread] [--json] [--limit N]
                                         List balance/system alerts
   alerts ack <id> [<id> ...]            Mark specific alerts as read
@@ -1691,6 +2092,13 @@ Commands:
   stats                                 Show aggregate statistics
   dashboard                             Show full Agent dashboard
   balance [--limit N]                   Show account balance snapshots
+  funds show                            Show Spot/default Perps/relevant dex balances
+  funds spot-to-perp <amount>           Transfer USDC from Spot to default Perps
+  funds perp-to-spot <amount>           Transfer USDC from default Perps to Spot
+  funds to-dex <dex> <amount>           Transfer USDC from default Perps to builder dex
+  funds from-dex <dex> <amount>         Transfer USDC from builder dex to default Perps
+  account-mode show                     Show Hyperliquid account abstraction mode
+  account-mode set-manual [--yes]       Switch to manual (standard) account mode
   update status                          Show local update state
   update check [--manifest-url URL]      Check official update manifest
   update apply [--package PATH] --yes    Apply an update after user confirmation
@@ -1701,9 +2109,10 @@ Commands:
 
 def main() -> None:
     argv = sys.argv[1:]
+    explicit_config = len(argv) >= 2 and argv[0] == "--config"
 
     # 解析全局 --config 参数
-    if len(argv) >= 2 and argv[0] == "--config":
+    if explicit_config:
         config_path = Path(argv[1])
         if not config_path.exists():
             print(f"ERROR: config file not found: {config_path}")
@@ -1717,6 +2126,10 @@ def main() -> None:
 
     cmd = argv[0]
     rest = argv[1:]
+
+    if cmd in {"funds", "account-mode"} and not explicit_config:
+        print(f"ERROR: {cmd} 命令必须显式指定 --config <path>")
+        raise SystemExit(1)
 
     if cmd == "service":
         cmd_service(rest)
@@ -1740,9 +2153,11 @@ def main() -> None:
     elif cmd == "moss":
         if not rest or rest[0] == "register":
             cmd_moss_register()
+        elif rest[0] == "inspect":
+            cmd_moss_inspect(rest[1:])
         else:
             print(f"Unknown moss subcommand: {rest[0]}")
-            print("Usage: moss register")
+            print("Usage: moss <register|inspect [AGENT_ID]>")
     elif cmd == "alerts":
         if not rest or rest[0] == "list":
             cmd_alerts_list(rest[1:])
@@ -1769,6 +2184,10 @@ def main() -> None:
         cmd_dashboard()
     elif cmd == "balance":
         cmd_balance(rest)
+    elif cmd == "funds":
+        cmd_funds(rest)
+    elif cmd == "account-mode":
+        cmd_account_mode(rest)
     elif cmd == "update":
         cmd_update(rest)
     else:

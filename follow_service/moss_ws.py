@@ -26,8 +26,11 @@ from .trader import (
     _build_clients,
     _do_sync_coin,
     _expected_pos,
+    _coin_dex,
+    _dexes_for_coins,
     _get_coin_lock,
     _get_follow_ratio,
+    _get_mids,
     _get_positions,
     _get_sz_decimals,
     _is_coin_tradeable,
@@ -54,8 +57,20 @@ def _get_moss_config() -> dict:
 
 def _symbol_to_coin(symbol: str) -> str | None:
     """将 Moss symbol 映射为 Hyperliquid coin。"""
-    coin = symbol_to_coin(symbol, _get_moss_config().get("symbol_map", {}))
-    return hyper_coins.canonicalize_coin(coin) or coin
+    moss_cfg = _get_moss_config()
+    market_scope = str(moss_cfg.get("market_scope") or "")
+    coin = symbol_to_coin(
+        symbol,
+        moss_cfg.get("symbol_map", {}),
+        hyper_coins.get_supported_coins(),
+        hip3_bare_fallback=bool(moss_cfg.get("hip3_bare_symbol_fallback", False)),
+        preferred_dex=market_scope if market_scope and market_scope != "default" else None,
+    )
+    canonical = hyper_coins.canonicalize_coin(coin) if coin else None
+    if not canonical:
+        logger.warning("Unknown or unsupported Moss symbol: %s, resolved_coin=%s", symbol, coin)
+        return None
+    return canonical
 
 
 def _event_fill_tid(event: dict) -> str:
@@ -120,7 +135,12 @@ def _init_baseline_from_bootstrap(
         if db.has_baseline(agent_address):
             try:
                 _, info = _build_clients()
-                _, _, our_positions = _get_positions(info, our_account)
+                baseline_dexes = _dexes_for_coins(
+                    db.get_baselines(agent_address)
+                )
+                _, _, our_positions, _ = _get_positions(
+                    info, our_account, dexes=baseline_dexes
+                )
                 if our_positions:
                     logger.info("Moss WS baseline already exists (after lock), skipping")
                     db.mark_baseline_init_seen(agent_address)
@@ -146,17 +166,18 @@ def _init_baseline_from_bootstrap(
 
         exchange, info = _build_clients()
         agent_positions = hyper_coins.canonicalize_positions(agent_positions, info=info)
-        our_acct_val, _, our_positions = _get_positions(info, our_account)
-        mids = info.all_mids()
+        dexes = _dexes_for_coins(agent_positions)
+        our_acct_total, _, our_positions, our_acct_values = _get_positions(
+            info, our_account, dexes=dexes
+        )
+        mids = _get_mids(info, set(agent_positions) | set(our_positions))
 
-        ratio = our_acct_val / agent_acct_val if agent_acct_val > 0 else 0.0
-        ratio = ratio * _get_follow_ratio()
         slippage = cfg.get("slippage_percent", 1.5) / 100.0
         init_loss_pct = cfg.get("alignment_loss_pct", 3.0) / 100.0
 
         logger.info(
-            "Moss WS baseline init: agent_acct=%.2f our_acct=%.2f ratio=%.4f",
-            agent_acct_val, our_acct_val, ratio,
+            "Moss WS baseline init: agent_acct=%.2f our_acct_total=%.2f dexes=%s",
+            agent_acct_val, our_acct_total, dexes,
         )
 
         if not agent_positions:
@@ -165,6 +186,11 @@ def _init_baseline_from_bootstrap(
             return
 
         for coin, agent_pos in agent_positions.items():
+            our_acct_val = our_acct_values.get(_coin_dex(coin), 0.0)
+            ratio = (
+                our_acct_val / agent_acct_val * _get_follow_ratio()
+                if agent_acct_val > 0 else 0.0
+            )
             agent_size = agent_pos["size"]
             agent_entry = agent_pos["entry_px"]
             agent_leverage = agent_pos["leverage"]
@@ -342,8 +368,10 @@ def _handle_source_event(
         results = fan_out({
             "moss_positions": moss_client.get_positions,
             "moss_account": moss_client.get_account,
-            "our_state": lambda: _get_positions(info, our_account),
-            "mids": info.all_mids,
+            "our_state": lambda: _get_positions(
+                info, our_account, dexes=_dexes_for_coins([coin])
+            ),
+            "mids": lambda: _get_mids(info, [coin]),
         })
     except Exception as e:
         logger.exception("Moss WS: parallel fetch failed for %s: %s", coin, e)
@@ -361,7 +389,7 @@ def _handle_source_event(
         logger.warning("Moss agent account value=0, skipping delta sync")
         return
 
-    our_acct_val, _, our_positions = results["our_state"]
+    _, _, our_positions, our_acct_values = results["our_state"]
     mids = results["mids"]
     baselines = db.get_baselines(agent_address)
 
@@ -405,7 +433,7 @@ def _handle_source_event(
             coin=coin,
             agent_address=agent_address,
             agent_acct_val=agent_acct_val,
-            our_acct_val=our_acct_val,
+            our_acct_values=our_acct_values,
             agent_positions=agent_positions,
             our_positions=our_positions,
             baselines=baselines,

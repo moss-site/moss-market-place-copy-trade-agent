@@ -23,8 +23,11 @@ from .trader import (
     _build_clients,
     _do_sync_coin,
     _expected_pos,
+    _coin_dex,
+    _dexes_for_coins,
     _get_coin_lock,
     _get_follow_ratio,
+    _get_mids,
     _get_positions,
     _get_sz_decimals,
     _is_coin_tradeable,
@@ -38,6 +41,8 @@ from .symbols import symbol_to_coin
 
 logger = logging.getLogger("follow_agent.moss_poller")
 
+_FILL_CURSOR_OVERLAP_SECONDS = 30
+
 
 def _get_moss_config() -> dict:
     return cfg.get_moss_source_config()
@@ -45,8 +50,20 @@ def _get_moss_config() -> dict:
 
 def _symbol_to_coin(symbol: str) -> str | None:
     """将 Moss symbol 映射为 Hyperliquid coin。"""
-    coin = symbol_to_coin(symbol, _get_moss_config().get("symbol_map", {}))
-    return hyper_coins.canonicalize_coin(coin) or coin
+    moss_cfg = _get_moss_config()
+    market_scope = str(moss_cfg.get("market_scope") or "")
+    coin = symbol_to_coin(
+        symbol,
+        moss_cfg.get("symbol_map", {}),
+        hyper_coins.get_supported_coins(),
+        hip3_bare_fallback=bool(moss_cfg.get("hip3_bare_symbol_fallback", False)),
+        preferred_dex=market_scope if market_scope and market_scope != "default" else None,
+    )
+    canonical = hyper_coins.canonicalize_coin(coin) if coin else None
+    if not canonical:
+        logger.warning("Unknown or unsupported Moss symbol: %s, resolved_coin=%s", symbol, coin)
+        return None
+    return canonical
 
 
 def _fill_tid_from_fill(fill: dict) -> str:
@@ -117,7 +134,12 @@ def _init_moss_baseline(
             if our_account:
                 try:
                     _, info = _build_clients()
-                    _, _, our_positions = _get_positions(info, our_account)
+                    baseline_dexes = _dexes_for_coins(
+                        db.get_baselines(agent_address)
+                    )
+                    _, _, our_positions, _ = _get_positions(
+                        info, our_account, dexes=baseline_dexes
+                    )
                     if not our_positions:
                         logger.info("Moss baseline exists but our positions are empty — force reinit")
                         db.clear_baselines(agent_address)
@@ -152,16 +174,17 @@ def _init_moss_baseline(
 
         exchange, info = _build_clients()
         agent_positions = hyper_coins.canonicalize_positions(agent_positions, info=info)
-        our_acct_val, _, our_positions = _get_positions(info, our_account)
-        mids = info.all_mids()
+        dexes = _dexes_for_coins(agent_positions)
+        our_acct_total, _, our_positions, our_acct_values = _get_positions(
+            info, our_account, dexes=dexes
+        )
+        mids = _get_mids(info, set(agent_positions) | set(our_positions))
 
-        ratio = our_acct_val / agent_acct_val if agent_acct_val > 0 else 0.0
-        ratio = ratio * _get_follow_ratio()
         slippage = cfg.get("slippage_percent", 1.5) / 100.0
 
         logger.info(
-            "Moss baseline init: agent_acct=%.2f our_acct=%.2f ratio=%.4f",
-            agent_acct_val, our_acct_val, ratio,
+            "Moss baseline init: agent_acct=%.2f our_acct_total=%.2f dexes=%s",
+            agent_acct_val, our_acct_total, dexes,
         )
 
         if not agent_positions:
@@ -172,6 +195,11 @@ def _init_moss_baseline(
         init_loss_pct = cfg.get("alignment_loss_pct", 3.0) / 100.0
 
         for coin, agent_pos in agent_positions.items():
+            our_acct_val = our_acct_values.get(_coin_dex(coin), 0.0)
+            ratio = (
+                our_acct_val / agent_acct_val * _get_follow_ratio()
+                if agent_acct_val > 0 else 0.0
+            )
             agent_size = agent_pos["size"]       # signed: +多 -空
             agent_entry = agent_pos["entry_px"]
             agent_leverage = agent_pos["leverage"]
@@ -331,15 +359,18 @@ def _handle_moss_fill(
     处理单笔 Moss fill：记录事件 + 查仓位 + delta 对齐。
     在 executor 线程中运行（阻塞式）。
     """
+    fill_id = fill.get("fill_id", "")
+    fill_tid = _fill_tid_from_fill(fill)
+    process_key = _process_key_from_fill(fill)
+    if db.is_synced_process_key(process_key):
+        return
+
     symbol = fill.get("symbol", "")
     coin = _symbol_to_coin(symbol)
     if not coin:
         logger.warning("Unknown Moss symbol: %s, skipping", symbol)
         return
 
-    fill_id = fill.get("fill_id", "")
-    fill_tid = _fill_tid_from_fill(fill)
-    process_key = _process_key_from_fill(fill)
     side = fill.get("side", "")
     fill_qty = float(fill.get("qty", 0))
     fill_price = float(fill.get("price", 0))
@@ -388,8 +419,10 @@ def _handle_moss_fill(
         results = fan_out({
             "moss_positions": moss_client.get_positions,
             "moss_account": moss_client.get_account,
-            "our_state": lambda: _get_positions(info, our_account),
-            "mids": info.all_mids,
+            "our_state": lambda: _get_positions(
+                info, our_account, dexes=_dexes_for_coins([coin])
+            ),
+            "mids": lambda: _get_mids(info, [coin]),
         })
     except Exception as e:
         logger.exception("Moss poller: parallel fetch failed for %s: %s", coin, e)
@@ -402,7 +435,7 @@ def _handle_moss_fill(
         logger.warning("Moss agent account value=0, skipping delta sync for %s", coin)
         return
 
-    our_acct_val, _, our_positions = results["our_state"]
+    _, _, our_positions, our_acct_values = results["our_state"]
     mids = results["mids"]
     baselines = db.get_baselines(agent_address)
 
@@ -453,7 +486,7 @@ def _handle_moss_fill(
             coin=coin,
             agent_address=agent_address,
             agent_acct_val=agent_acct_val,
-            our_acct_val=our_acct_val,
+            our_acct_values=our_acct_values,
             agent_positions=agent_positions,
             our_positions=our_positions,
             baselines=baselines,
@@ -519,6 +552,36 @@ def _replay_pending_moss_fills(moss_client: MossClient, agent_address: str) -> N
             logger.warning("Cannot replay pending Moss fill event: %s", row.get("fill_tid"))
             continue
         _handle_moss_fill(fill, agent_address, moss_client)
+
+
+def _poll_fills_once(
+    moss_client: MossClient,
+    from_ts: str,
+    agent_address: str,
+) -> str:
+    """完成一轮增量拉取；成功后按已见最大时间推进带重叠的查询水位。"""
+    new_fills = moss_client.get_fills(from_ts, 50)
+    if not new_fills:
+        return from_ts
+
+    new_fills.sort(key=lambda fill: int(fill.get("fill_id", 0)))
+    for fill in new_fills:
+        _handle_moss_fill(fill, agent_address, moss_client)
+
+    timestamps = [
+        fill.get("created_at")
+        for fill in new_fills
+        if isinstance(fill.get("created_at"), str) and fill.get("created_at")
+    ]
+    if not timestamps:
+        return from_ts
+
+    max_seen_ts = max(timestamps)
+    next_from_ts = db.moss_fill_cursor_with_overlap(
+        max_seen_ts,
+        overlap_seconds=_FILL_CURSOR_OVERLAP_SECONDS,
+    )
+    return max(from_ts, next_from_ts)
 
 
 async def run_moss_poller(stop_event: asyncio.Event, baseline_lock: "threading.Lock | None" = None) -> None:
@@ -602,21 +665,13 @@ async def run_moss_poller(stop_event: asyncio.Event, baseline_lock: "threading.L
     backoff = poll_interval
     while not stop_event.is_set():
         try:
-            new_fills = await loop.run_in_executor(
-                None, moss_client.get_fills, last_fill_ts, 50
+            last_fill_ts = await loop.run_in_executor(
+                None,
+                _poll_fills_once,
+                moss_client,
+                last_fill_ts,
+                agent_address,
             )
-
-            if new_fills:
-                # 按 fill_id 排序（递增）
-                new_fills.sort(key=lambda f: int(f.get("fill_id", 0)))
-
-                for fill in new_fills:
-                    await loop.run_in_executor(
-                        None, _handle_moss_fill, fill, agent_address, moss_client
-                    )
-
-                # 更新游标
-                last_fill_ts = new_fills[-1].get("created_at", last_fill_ts)
 
             # 成功后重置退避
             backoff = poll_interval

@@ -23,16 +23,21 @@ description: Manage the Hyperliquid copy-trading (follow) agent service. Use whe
 ## 重要限制
 
 1. **币种限制**：跟单不再按主流币白名单限制；`allowed_coins` 仅为旧配置兼容字段。实际放行条件为：Moss symbol 解析成 Hyperliquid coin 后，存在于配置同目录的 `hyper_supported_coins.json`（每 10 分钟刷新）。symbol 解析支持 `BTCUSDT` / `BTCUSDC` / `BTC-USDC` / `BTC/USDT` → `BTC`，并按 HL universe 修正大小写（如 `KNEIROUSDC` → `kNEIRO`）。
-2. **余额监控与告警**：服务启动后会自动监控账户余额。当 withdrawable 低于 `low_balance_threshold_usd`（默认 10 USDC）时入库告警，由 Bot 轮询拉取后提醒用户充值。告警频率：每天最多 3 次，每次间隔至少 10 分钟
+2. **资金位置与账户模式**：跟单资金必须位于 Hyperliquid **Perps（默认 dex）**余额；入金后资金可能先落在 Spot，必须先转到 Perps 才能跟单。若目标涉及 HIP-3 builder dex（如 `xyz:NVDA` 美股），还必须向**对应 builder dex 单独存入保证金**，每个 dex 都是独立 clearinghouse，默认 Perps 余额不能直接供 `xyz` 使用。账户必须处于**手动（标准）模式**；统一账户/投资组合保证金模式下服务无法按当前口径读取正确余额，preflight 会阻断并提示切换。
+3. **余额监控与告警**：服务启动后会自动监控账户余额。当 withdrawable 低于 `low_balance_threshold_usd`（默认 10 USDC）时入库告警，由 Bot 轮询拉取后提醒用户。告警频率：每天最多 3 次，每次间隔至少 10 分钟。对话中的余额摘要和告警必须按 dex 分列播报，不能把不同 clearinghouse 的余额合并后描述成任一 dex 的可用资金。
+4. **Agent 历史与单账户限制**：只跟有成交历史的 Agent。选择、启动和恢复前查询最近最多 20 条成交：至少一条，每条 symbol 都必须可识别，且全部同属美股或非美股。美股锁定 `xyz`；BTC/普通合约及可交易多个非美股币种的异动策略锁定默认 Perps。无历史、混合类型、未知 symbol 或其他 HIP-3 DEX 一律不跟。运行时不得跨 `market_scope` 下单。
 
 ## 对话输出硬性规则
 
-1. **安装完成后直接给授权链接**：用户要求安装/更新/测试跟单 skill，且已生成 Agent Wallet 后，回复必须包含 Agent Wallet 地址、网络、授权页面完整 URL（从配置中的 `hl_authorize_url` 拼接 `<wallet_address>`）。不要只说“去授权页面”，也不要等用户追问“授权页面是多少”。如果用户同时提到 agent 协议上报 / Agent Protocol Report / 服务交易日志上报，授权提示里还必须说明：Hyperliquid 授权只用于交易；Agent Protocol 日志上报需要在 Agent Protocol 平台把当前服务钱包配置/授权为协议 Agent 的 executor，并在本地配置 `agent_protocol_report.*` 后打开 `agent_protocol_report.enabled`。
+1. **安装完成后直接给授权链接**：用户要求安装/更新/测试跟单 skill，且已生成 Agent Wallet 后，回复必须包含 Agent Wallet 地址、网络、授权页面完整 URL（从配置中的 `hl_authorize_url` 拼接 `<wallet_address>`）。不要只说“去授权页面”，也不要等用户追问“授权页面是多少”。授权提示必须同时提醒：如果后续选择的是美股 / `xyz` HIP-3 Moss Agent，主账号必须在 Hyperliquid 页面设置为手动（标准、非统一账户）模式；建议用户授权 Agent/Builder 时顺手检查账户类型，若是统一账户或投资组合保证金，先在页面切换为手动（标准）模式。如果用户同时提到 agent 协议上报 / Agent Protocol Report / 服务交易日志上报，授权提示里还必须说明：Hyperliquid 授权只用于交易；Agent Protocol 日志上报需要在 Agent Protocol 平台把当前服务钱包配置/授权为协议 Agent 的 executor，并在本地配置 `agent_protocol_report.*` 后打开 `agent_protocol_report.enabled`。
 2. **授权成功后一次性收集信息**：用户说“授权成功”后，提示他可以一次性发送 `主钱包地址 + 跟单 Agent ID/链接`；同时按当前网络给出 Moss Agent 列表页面（主网 `https://moss.site/agent?mode=realtime`；测试网 `https://alpha.moss.site/agent?mode=realtime`），让用户自行选择并复制链接或 ID。如果只提供其中一个，再追问缺失项。
 3. **跟单启动成功后输出简洁摘要**：启动成功消息保持简洁，但需比日常推送信息更完整，至少包含 Agent、Agent 持仓、初始化执行结果、跟单比例、滑点、币种过滤规则（Hyperliquid 支持币缓存）、主钱包地址、Agent Wallet 地址、Follower ID（若有）、网络和运行状态。不要默认输出止损/止盈或轮询间隔，除非用户刚配置或主动询问。
 4. **讨论充值时必须明确充值目标**：当用户询问充值、补保证金、余额不足怎么办时，Bot 必须明确提醒“请充值到主钱包对应的 Hyperliquid 账户”，不要让用户误解成直接链上转账到主钱包地址本身。
 5. **配置 Agent ID 前给列表页面**：用户授权结束后需要配置 `moss_source.agent_id`，或用户选择/切换跟单 Agent 时，Bot 不能只要求用户输入 `agt_xxx`；必须先提供当前网络对应的 Moss Agent 列表页面（主网 `https://moss.site/agent?mode=realtime`；测试网 `https://alpha.moss.site/agent?mode=realtime`），让用户自行挑选并复制 Agent 链接或 ID。不要编造或内置推荐列表。
 6. **正式开始跟单前必须完成风险参数问答**：在执行 `service start` / `service resume` 之前，用户必须明确回答“是否设置跟单资金比例”和“是否设置止盈或止损点”两个问题；不能用默认值静默跳过，也不能在用户未回答时启动服务。升级后也必须重新提醒并确认这两项配置，即使该实例之前已经启动过或已经配置过。
+7. **启动/恢复前逐 dex 核查资金和账户模式**：执行 `service start` / `service resume` 前，Bot 必须先执行 `funds show` 和 `account-mode show` 并向用户播报：① Spot USDC 与默认 Perps dex 可用余额；② 若目标 Agent 当前持仓或 `symbol_map` 涉及 HIP-3 dex，逐个播报对应 dex 保证金；为 0 时必须明确说“需向 `<dex>` dex 划转保证金”，在用户明确划转金额并确认后优先执行 `funds to-dex <dex> <amount>`；若资金仍在 Spot，在用户确认金额后优先执行 `funds spot-to-perp <amount>`；③ 检测到统一账户/投资组合保证金模式时，先解释影响，并优先要求用户用主钱包在 Hyperliquid 页面切换为手动（标准、非统一账户）模式；只有用户明确要求命令尝试时才执行 `account-mode set-manual --yes`，且失败后必须回到 UI 兜底。任何充值引导都必须说明：入金后资金可能落在 Spot，需转到 Perps 才能跟单；HIP-3 还需再向对应 builder dex 单独划转。所有命令必须带当前实例的 `--config <path>`。
+8. **切换必须先全平再迁移资金**：先验证新 Agent 历史，随后停止老服务以阻断新信号，再关闭老账户全部持仓并复查仓位为 0；仍有仓位时不得清 baseline、不得改 Agent、不得转资金。新旧 scope 不同时，平仓结算后展示旧账户最新 `accountValue` 和 `withdrawable`，只允许把准确的 `withdrawable`（按精度向下取整）作为“全部可划转资金”。用户确认明确金额和方向后才执行 `funds to-dex xyz` / `funds from-dex xyz`；失败则保持暂停，不启动新 Agent。
+9. **不得用手改 Agent 绕过全平**：`service start` 会把没有同 Agent scope/baseline 证据的配置视为新选择，并查询默认 Perps 与 xyz 的全部持仓；任一老仓非 0 都会阻断。切换必须使用 `service switch <NEW_AGENT_ID>`，不要只执行 `config set moss_source.agent_id` 后直接 resume。
 
 ---
 
@@ -97,10 +102,18 @@ python3 -m venv .venv
     "base_url": "http://54.255.3.5:8088",
     "agent_id": "agt_xxx",
     "fill_poll_secs": 15,
-    "symbol_map": {"BTCUSDT":"BTC","BTCUSDC":"BTC","ETHUSDT":"ETH","ETHUSDC":"ETH","SOLUSDT":"SOL","SOLUSDC":"SOL","BNBUSDT":"BNB","BNBUSDC":"BNB","APTUSDT":"APT","APTUSDC":"APT","ATOMUSDT":"ATOM","ATOMUSDC":"ATOM","ARBUSDT":"ARB","ARBUSDC":"ARB","AVAXUSDT":"AVAX","AVAXUSDC":"AVAX","ADAUSDT":"ADA","ADAUSDC":"ADA","BCHUSDT":"BCH","BCHUSDC":"BCH","DOGEUSDT":"DOGE","DOGEUSDC":"DOGE","DOTUSDT":"DOT","DOTUSDC":"DOT","FILUSDT":"FIL","FILUSDC":"FIL","HBARUSDT":"HBAR","HBARUSDC":"HBAR","LINKUSDT":"LINK","LINKUSDC":"LINK","LTCUSDT":"LTC","LTCUSDC":"LTC","NEARUSDT":"NEAR","NEARUSDC":"NEAR","OPUSDT":"OP","OPUSDC":"OP","SUIUSDT":"SUI","SUIUSDC":"SUI","TRXUSDT":"TRX","TRXUSDC":"TRX","XRPUSDT":"XRP","XRPUSDC":"XRP","UNIUSDT":"UNI","UNIUSDC":"UNI"}
+    "market_scope": "",
+    "hip3_bare_symbol_fallback": false,
+    "symbol_map": {
+      "S&P500USDC": "xyz:SP500",
+      "WTIOILUSDC": "xyz:CL",
+      "SKHYNIXUSDC": "xyz:SKHX"
+    }
   }
 }
 ```
+
+`symbol_map` 只保留 Moss 与 Hyperliquid 命名不一致的真别名。普通合约如 `BTCUSDC` 会剥离报价后自动解析为 `BTC`；已通过 `moss inspect --persist` 验证为 `market_scope=xyz` 的美股/HIP-3 Agent，`AVGOUSDC` 这类裸 ticker 会优先从 Hyperliquid supported perp cache 自动解析为 `xyz:AVGO`，不要为每只新股手工加配置。
 
 ### Moss Follower 鉴权
 
@@ -125,7 +138,7 @@ python3 -m venv .venv
 • 网络: 测试网
 • 授权页面: https://alpha.moss.site/hyperliquid/authorize/0xAGENT_ADDRESS
 
-请用主钱包打开授权页面完成授权。授权成功后，可以去 Moss Agent 列表选择想跟单的 Agent（按当前网络选择）：
+请用主钱包打开授权页面完成 Agent/Builder 授权。若后续要跟单美股 / `xyz` Agent，请同时在 Hyperliquid 页面检查账户类型：必须是手动（标准、非统一账户）模式；如果当前是统一账户或投资组合保证金，请先切换为手动（标准）模式。授权成功后，可以去 Moss Agent 列表选择想跟单的 Agent（按当前网络选择）：
 • 主网：https://moss.site/agent?mode=realtime
 • 测试网：https://alpha.moss.site/agent?mode=realtime
 然后一次性把「主钱包地址 + Agent 链接或 ID」发给我。
@@ -193,9 +206,10 @@ https://alpha.moss.site/hyperliquid/authorize/0xAbCd...1234
 .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config show   # 查看 wallet_address 字段
 ```
 
-需完成两项授权：
+需完成两项授权，并检查账户类型：
 1. **Agent 授权** — 授权 `wallet_address` 为主账户的 Agent
 2. **Builder 授权** — 授权当前网络对应的 Builder 地址（见 `docs/network-config.md`）
+3. **美股/xyz 跟单账户类型** — 如果准备跟单美股 / `xyz` Agent，主账号必须设置为手动（标准、非统一账户）模式；请用户在 Hyperliquid 页面授权时同步检查，若是统一账户或投资组合保证金，先切换为手动（标准）模式
 
 如果用户要开启 Agent Protocol Report，还需额外在 Agent Protocol 平台侧完成 executor 配置/授权：把当前服务 `wallet_address` 配置为协议 Agent 的 executor，并提供协议 Agent 地址、executor 地址、API base URL 和 chain id。该平台侧授权独立于 Hyperliquid Agent/Builder 授权，不使用 `hl_authorize_url`。
 
@@ -319,17 +333,29 @@ https://alpha.moss.site/hyperliquid/authorize/0xAbCd...1234
 2. 解析输入提取 agent_id（支持两种格式）：
    - 完整链接：`moss.site/agent/agt_xxx` → 提取 `agt_xxx`
    - 纯 ID：`agt_xxx` → 直接使用
-3. 通过 Moss 公开 API 拉取 Agent 数据：
+3. 先通过 follower 鉴权查询最近最多 20 条成交并验证单一市场范围：
+   ```bash
+   .venv/bin/python cli.py --config <config> moss inspect agt_xxx
+   ```
+   无历史、混合类型、未知 symbol 或非 xyz 的 HIP-3 Agent 直接拒绝，不进入风险参数和资金流程。
+4. 通过 Moss 公开 API 拉取 Agent 展示数据：
    ```
    GET /api/v2/moss/trader/realtime/bots/:agent_id
    ```
-4. 展示 Agent 详情：
+5. 展示 Agent 详情及历史验证结果（`market_scope`、样本条数、symbols）：
    - 策略名称与风格描述
    - 累计收益率 (ROI)
    - 累计盈亏 (PnL)
    - 运行状态
    - 创建时间
-5. 询问用户是否确认跟单
+6. 若历史验证结果为 `market_scope=xyz`（美股 / HIP-3），立即执行账户模式检查：
+   ```bash
+   .venv/bin/python cli.py --config <config> account-mode show
+   ```
+   - 如果返回 `disabled`，告知用户账户类型已满足美股跟单要求。
+   - 如果返回 `unifiedAccount` 或 `portfolioMargin`，不要进入启动流程；明确提醒“该 Moss Agent 是美股/xyz 跟单，主账号必须设置为手动（标准、非统一账户）模式。请用主钱包打开 Hyperliquid 页面，在设置/账户类型中切换为手动（标准）模式；建议和 Agent/Builder 授权一起完成。切换完成后告诉我，我再继续检查资金并启动。”
+   - 不要承诺 Agent Wallet 可以替用户完成账户模式切换；`account-mode set-manual` 只能作为用户明确要求时的尝试命令，失败后仍需 UI 操作。
+7. 询问用户是否确认跟单
 
 ### 对应 CLI 操作
 
@@ -481,6 +507,16 @@ Bot 发送启动成功消息，告知用户 Agent 有新操作时会立即通知
 3. **检测到新 fill** → 查 Moss 仓位 → delta 对齐 → 在 HL 上 IOC 下单
 4. **Agent 平仓** → 基线自动归零 → 可跟新方向
 
+### 余额监控与告警
+
+- 默认 Perps dex 与每个 HIP-3 builder dex 都是独立 clearinghouse；余额、可用资金和保证金必须按 dex 分别理解。
+- Bot 输出启动摘要、状态摘要或余额不足告警时，必须先用 `.venv/bin/python cli.py --config <config> funds show` 刷新数据，分列“Spot USDC”“默认 Perps”和当前 Agent 持仓/`symbol_map` 涉及的每个 builder dex（例如 `xyz`），分别显示 accountValue/withdrawable；不得只播报跨 dex 合计值。
+- 默认 Perps 有余额不代表 `xyz` 可开仓；某 builder dex 保证金为 0 时，应明确播报“需向 `xyz` dex 划转保证金”。用户指定金额并确认后执行 `funds to-dex xyz <amount>`；仅当命令提示需主钱包签名时，再引导用户在 Hyperliquid UI 打开对应市场划转。
+- 充值/入金完成后应再次执行 `funds show` 核查资金落点：若仍在 Spot，用户确认金额后执行 `funds spot-to-perp <amount>`；若跟 HIP-3 标的，再用 `funds to-dex <dex> <amount>` 向对应 builder dex 单独划转。
+- 服务侧低余额事件用于触发提醒；Bot 消费告警后仍应按上述逐 dex 口径刷新并组织摘要，不能把 aggregate withdrawable 解释为所有 dex 共享购买力。
+
+资金划转和账户模式命令使用配置内的 `private_key` 签名。`funds to-dex/from-dex` 使用官方 L1 `agentSendAsset`：发送前必须验证私钥推导地址等于 `wallet_address`，且链上 `userRole(wallet_address).role=agent`、`data.user=main_address`；destination 固定为该 `main_address`，协议只允许同一主账户在默认 Perps 与 builder dex 间划转，不能向外部 user 转账。`usdClassTransfer` 与 `userSetAbstraction` 仍是 user-signed action，Agent Wallet 可能因需要主钱包权限而被拒绝。任何命令失败时必须如实播报非 0 结果及对应 UI 兜底路径，不能宣称已完成；不得在对话中展示私钥或完整签名。
+
 ### 主动推送通知
 每次 Agent 执行交易，Bot 推送通知，内容包含：
 - Agent 名称
@@ -515,7 +551,7 @@ Bot 发送启动成功消息，告知用户 Agent 有新操作时会立即通知
 |------|------|----------|
 | 暂停跟单 | 平掉所有持仓并停止跟单 | `service pause` |
 | 恢复跟单 | 从暂停状态重新开始跟单 | `service resume` |
-| 切换 Agent | 暂停当前跟单并引导配置新 Agent | `service switch` |
+| 切换 Agent | 验证新历史、停止老服务、确认全平并准备资金迁移 | `service switch <NEW_AGENT_ID>` |
 | 调整参数 | 重新配置跟单比例、止损、止盈、滑点 | `config set ...` |
 | 停止 | 进入二次确认流程 | `service stop` + 吊销 Agent |
 | 状态 | 返回当前跟单状态摘要 | `service status` + `stats` |
@@ -548,7 +584,7 @@ Bot：（执行 service pause）
 .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service pause
 ```
 
-`service pause` 会执行：全平仓 → 停止服务 → 清除基线。
+`service pause` 会执行：停止服务阻断新信号 → 全平仓 → 最多 5 次复查仓位为 0 → 清除基线。若仍有仓位则非 0 退出并保留基线。
 
 **异常处理**：
 - 用户回复「取消」→ Bot 回复「已取消，跟单继续运行」，不做任何操作
@@ -595,36 +631,32 @@ Bot：（执行 service resume）
 **触发场景**：用户想换一个跟单 Agent。
 
 ```
-用户：切换 Agent
+用户：切换 Agent，并发送新 Agent ID/链接
 
-Bot：（执行 service status 读取当前 agent_id）
+Bot：（先执行 moss inspect 验证新 Agent 最近最多 20 条成交）
      收到，切换 Agent 流程如下：
-     第一步：将自动暂停当前跟单并平仓
-     第二步：请您配置新的 Agent
-     第三步：配置完成后手动恢复跟单
+     第一步：验证新 Agent 只能使用 default 或 xyz 中一个账户
+     第二步：停止老服务并确认老持仓全部平仓
+     第三步：如账户类型改变，确认并迁移全部 withdrawable
+     第四步：资金到账后恢复跟单
 
      当前跟单 Agent：XXX
      确认开始切换吗？[确认] [取消]
 
 用户：确认
 
-Bot：（执行 service switch = service pause）
-     ✅ 已暂停当前跟单，持仓已平仓
-     请在 Moss 平台中选择配置新的 Agent（按当前网络选择）：主网 https://moss.site/agent?mode=realtime；测试网 https://alpha.moss.site/agent?mode=realtime
-     选择完成后，将 Agent 链接或 Agent ID（agt_xxx）发给我，我来帮您配置
+Bot：（执行 service switch agt_yyy）
+     ✅ 新 Agent 历史已验证，老持仓已确认全部关闭，新配置已写入
+     若 CLI 输出账户类型变化，同时展示：
+     - 来源 accountValue
+     - 实际可划转 withdrawable
+     - 划转方向和准确金额
+     然后询问是否按该准确金额划转；不要在用户确认前执行资金命令
 
-用户：（发送 Agent 链接 moss.site/agent/agt_yyy，或直接发送 agt_yyy）
+用户：确认划转
 
-Bot：（解析输入提取 agent_id，读取 Agent 信息，更新 moss_source.agent_id）
-     已解析新 Agent 信息：
-     - 名称：YYY
-     - 策略风格：...
-     - ROI：...
-     确认使用此 Agent 吗？[确认] [取消]
-
-用户：确认
-
-Bot：✅ 新 Agent 配置完成
+Bot：（执行 CLI 输出的 funds to-dex/from-dex 准确命令；失败则提示主钱包 UI 操作并保持暂停）
+     ✅ 资金到账后，重新执行 funds show 验证目标账户
      重新启动前还需要完成两项必答风险参数：
      1. 您是否需要设置跟单的资金比例？资金比例请输入 0%~100%，例如 30%、50%、100%。
      2. 您是否需要设置止盈或者止损点？止损请输入 0%~100%，例如止损 20%；止盈请输入 0%~300%，例如止盈 20%。注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。
@@ -639,9 +671,11 @@ Bot：（执行 service resume）
 对应 CLI：
 ```bash
 .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service status     # 读取当前 agent_id
-.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service pause      # 暂停 + 平仓
-# 用户发送新 Agent 链接后：
-.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set moss_source.agent_id agt_yyy
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json moss inspect agt_yyy
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service switch agt_yyy
+# 若 scope 改变，向用户展示 service switch 输出的准确 withdrawable；确认后执行其输出的资金命令，例如：
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json funds to-dex xyz 19.869100
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json funds show
 # 完成必答风险参数问答后：
 .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service resume     # 恢复
 ```
@@ -649,6 +683,8 @@ Bot：（执行 service resume）
 **异常处理**：
 - 用户任意步骤回复「取消」→ Bot 回复「已取消切换」，保持当前暂停状态
 - 解析 Agent 输入失败 → Bot 提示「无法识别，请粘贴 `moss.site/agent/agt_xxx` 格式链接，或直接发送 `agt_xxx` 形式的 Agent ID」
+- 新 Agent 没有成交历史或最近 20 条无法得到单一 scope → 不暂停老 Agent、不改配置
+- 老仓任一持仓未归零 → 保持暂停，保留旧 baseline 和旧 Agent 配置，不迁移资金
 
 ---
 
@@ -836,7 +872,9 @@ Bot 发送确认提示，说明：
 | `moss_source.base_url` | `http://54.255.3.5:8088` | Moss API 地址 |
 | `moss_source.agent_id` | — | Moss Agent ID（agt_xxx 格式） |
 | `moss_source.fill_poll_secs` | `15` | fills 轮询间隔（秒） |
-| `moss_source.symbol_map` | — | 币种映射；未命中时支持 `USDT`/`USDC`、`-`、`/` 兜底，并按 HL universe 修正大小写（如 `KNEIROUSDC` → `kNEIRO`） |
+| `moss_source.market_scope` | — | `moss inspect --persist` 写入的已验证市场范围；`xyz` 表示美股/HIP-3 builder dex，运行时只允许对应 scope 下单 |
+| `moss_source.hip3_bare_symbol_fallback` | `false` | 未验证 scope 时是否尝试裸 ticker 唯一匹配 HIP-3；默认关闭，避免同名歧义 |
+| `moss_source.symbol_map` | 少量真别名 | Moss symbol → HL coin；常规币和已验证 `market_scope=xyz` 的 HIP-3 裸 ticker 优先走 Hyperliquid supported perp cache 自动解析，配置仅保留 Moss/HL 命名不一致的别名（如 `S&P500USDC` → `xyz:SP500`） |
 
 ### 网络配置
 
@@ -894,10 +932,10 @@ Hyperliquid 是一个去中心化的永续合约交易所，所有跟单交易�
 Agent Wallet 的私钥加密存储在本地配置文件中，仅用于向 Hyperliquid 提交交易，不会发送到任何其他地方。私钥不会在对话中完整展示（始终脱敏显示）。建议用户妥善保管配置文件，不要分享给他人。
 
 **Q: 主钱包会被动用吗？资产有风险吗？**
-主钱包只参与一次签名操作（登记授权关系），之后所有交易都由 Agent Wallet 执行。主钱包的私钥不会被 Bot 存储或使用。资金始终在用户自己的 Hyperliquid 账户中，Agent Wallet 只是一个「下单代理」，不能提取资金。
+默认设计中主钱包只参与授权，之后的跟单交易由 Agent Wallet 执行；主钱包私钥不会写入 Bot 配置。默认 Perps 与 builder dex 之间使用 `agentSendAsset`，由已绑定 Agent 代理同一 `main_address` 安全划转；账户模式切换属于主账号设置，美股/`xyz` 跟单要求用户用主钱包在 Hyperliquid 页面切到手动（标准、非统一账户）模式，Bot 不应承诺 Agent Wallet 可代切。Bot 始终不得展示私钥或完整签名。
 
 **Q: 余额不足了，应该充值到哪里？**
-请充值到**主钱包对应的 Hyperliquid 账户**，不要理解成直接链上转账到主钱包地址本身。跟单实际使用的是主钱包在 Hyperliquid 里的资金余额；如果 Bot 提示余额不足，需要补的是这个 HL 账户里的可用资金。回复时应明确区分“主钱包地址”和“主钱包对应的 HL 账户”，避免用户充错地方。
+请充值到**主钱包对应的 Hyperliquid 账户**，不要理解成直接链上转账到主钱包地址本身。Bot 先执行 `funds show` 确认资金落点；入金若在 Spot，用户确认金额后执行 `funds spot-to-perp <amount>`；如果目标是 `xyz:NVDA` 等 HIP-3 标的，再执行 `funds to-dex xyz <amount>` 单独划转保证金。命令若提示需主钱包签名，才引导用户使用 Hyperliquid UI 的 `Portfolio → Transfer` 或打开对应 dex 市场划转。Bot 应按 dex 分别说明哪里余额不足，避免把默认 Perps 或其他 dex 的资金误认为 `xyz` 可用保证金。
 
 **Q: 跟单亏损怎么办？谁负责？**
 Bot 只是忠实地复制 Agent 的交易行为，不对交易结果负责，也不保证收益。Agent 策略本身可能出现亏损。建议用户：
@@ -1033,7 +1071,7 @@ Bot 不提供投资建议，也不推荐具体的 Agent。建议你在 Moss 平�
 
 **Q: 跟单执行失败了？**
 可能原因：
-- **余额不足** — 账户可用余额不够开仓，需充值到主钱包对应的 Hyperliquid 账户，不是直接转到主钱包地址本身
+- **余额不足** — 先执行 `funds show` 确认资金落点；默认合约使用 `funds spot-to-perp <amount>` 转到 Perps，HIP-3 再使用 `funds to-dex <dex> <amount>` 向对应 builder dex 单独划转。写命令需用户确认金额；若因 Agent Wallet 权限失败，再给出 UI 主钱包签名路径。需充值时充值到主钱包对应的 Hyperliquid 账户，不是直接转到主钱包地址本身
 - **滑点过大** — 市场波动剧烈，实际价格超出滑点限制，可适当调大滑点
 - **网络问题** — 与 Hyperliquid 或 Moss 的连接中断，Bot 会自动重连；Moss follower 注册失败会报错退出，需要用户修复后重启
 - **下单金额太小** — 低于 Hyperliquid 最小下单量
@@ -1112,7 +1150,7 @@ Bot 只支持跟单模式（复制 Moss Agent 的交易），不支持用户自�
    .venv/bin/python cli.py service start
    .venv/bin/python cli.py --config config.json service start
    ```
-   替代方式：设置环境变量 `FOLLOW_CONFIG=~/.hyperliquid-copy-trade/f4c4cb/config_f4c4cb.json`
+   无 CLI 的内部服务启动仍可设置环境变量 `FOLLOW_CONFIG=~/.hyperliquid-copy-trade/f4c4cb/config_f4c4cb.json`；但 `funds` / `account-mode` 正式 CLI 子命令必须显式带 `--config`，环境变量不能替代。
 
 3. **启动前检查流程**：
    ```bash
@@ -1297,7 +1335,7 @@ Bot 只支持跟单模式（复制 Moss Agent 的交易），不支持用户自�
    - watchdog 只有在 `service_state.json` 中 `watchdog_enabled=true`、`desired_state=running`、`maintenance_mode=false`，且服务 PID 不存活、未触发重启限流时才会执行 `service start`。
    - 不要执行 `config set watchdog_enabled ...`；运行态字段会被配置层拒绝/清理，自动重启只能通过 `service watchdog enable|disable|status` 管理。
    - `install` / `enable` 不会主动启动服务；如果服务当前已运行，会同步 `desired_state=running`，后续异常退出才会自动拉起。
-   - watchdog 拉起服务时，`service start` 输出会写入 `watchdog.log`；不要用 pipe/capture 包住启动命令，避免 fork 后台子进程继承输出句柄导致 check 卡住。
+   - watchdog 拉起服务时，`service start` 输出会写入 `watchdog.log`；后台服务本身通过全新 Python 子进程启动并把 stdout/stderr 重定向到实例日志。
 
 2. **用户确认**
    - 安装前必须说明：如果用户执行 `service stop` 或 `service pause`，watchdog 不会自动拉起；`pause` 仍会平仓并清基线。

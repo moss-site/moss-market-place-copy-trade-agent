@@ -18,6 +18,8 @@ import requests as _requests
 from eth_account import Account
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
+from hyperliquid.utils.constants import MAINNET_API_URL
+from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
 
 from . import config as cfg
 from . import database as db
@@ -41,6 +43,42 @@ _EXPECTED_POS_TTL = 10.0
 # Per-coin 互斥锁：防止 WS 和 poller 并发对同一 coin 重复下单
 _coin_locks: dict[str, threading.Lock] = {}
 _coin_locks_mutex = threading.Lock()
+_margin_mode_lock = threading.Lock()
+
+
+def agent_send_asset(
+    exchange: Exchange,
+    *,
+    source_dex: str,
+    destination_dex: str,
+    token: str,
+    amount: float,
+):
+    """Move collateral between one main account's DEXes via its approved Agent."""
+    destination = str(exchange.account_address or "").lower()
+    if not destination:
+        raise ValueError("agentSendAsset requires Exchange.account_address")
+    nonce = get_timestamp_ms()
+    action = {
+        "type": "agentSendAsset",
+        "destination": destination,
+        "sourceDex": source_dex,
+        "destinationDex": destination_dex,
+        "token": token,
+        "amount": str(amount),
+        "fromSubAccount": "",
+        "nonce": nonce,
+    }
+    signature = sign_l1_action(
+        exchange.wallet,
+        action,
+        exchange.vault_address,
+        nonce,
+        exchange.expires_after,
+        exchange.base_url == MAINNET_API_URL,
+    )
+    return exchange._post_action(action, signature, nonce)
+
 
 
 def _get_coin_lock(coin: str) -> threading.Lock:
@@ -80,29 +118,119 @@ def _get_spot_meta(api_url: str) -> dict:
 
 
 _clients_cache: tuple["Exchange", "Info"] | None = None
+_clients_cache_key: tuple[str, ...] | None = None
+_clients_degraded_at: float | None = None
 _clients_lock = threading.Lock()
+_CLIENT_DEGRADED_RETRY_SECS = 60.0
 
 
 def _build_clients() -> tuple[Exchange, Info]:
     """构建 Exchange 和 Info 客户端（整体缓存，避免每次事件重建耗时 10s+）。"""
-    global _clients_cache
+    global _clients_cache, _clients_cache_key, _clients_degraded_at
+    relevant_dexes = _get_relevant_dexes()
+    expected_key = tuple(relevant_dexes)
     with _clients_lock:
-        if _clients_cache is not None:
-            return _clients_cache
+        previous = _clients_cache
+        previous_key = _clients_cache_key
+        if previous is not None:
+            if previous_key == expected_key:
+                return previous
+            if (
+                _clients_degraded_at is not None
+                and _time.monotonic() - _clients_degraded_at
+                < _CLIENT_DEGRADED_RETRY_SECS
+            ):
+                return previous
 
-        private_key = cfg.get("private_key", "")
-        if not private_key:
-            raise ValueError("private_key is not configured")
-        api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
-        main_address = cfg.get("main_address") or None
+        try:
+            private_key = cfg.get("private_key", "")
+            if not private_key:
+                raise ValueError("private_key is not configured")
+            api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+            main_address = cfg.get("main_address") or None
 
-        wallet = Account.from_key(private_key)
-        spot_meta = _get_spot_meta(api_url)
-        info = Info(api_url, skip_ws=True, spot_meta=spot_meta)
-        meta = info.meta()
-        hyper_coins.write_supported_coins_from_meta(meta, api_url=api_url)
-        exchange = Exchange(wallet, api_url, meta=meta, account_address=main_address, spot_meta=spot_meta)
+            wallet = Account.from_key(private_key)
+            spot_meta = _get_spot_meta(api_url)
+            available_dexes = set(hyper_coins.get_perp_dexs())
+            available_dexes.add("")
+            missing_dexes = [
+                dex for dex in relevant_dexes if dex not in available_dexes
+            ]
+            if missing_dexes:
+                logger.error(
+                    "HIP-3 client degraded: relevant dexes missing from perpDexs and skipped: %s",
+                    missing_dexes,
+                )
+            perp_dexs = [dex for dex in relevant_dexes if dex in available_dexes]
+            if not perp_dexs:
+                perp_dexs = [""]
+
+            previous_dexes = set(previous_key or ())
+            if (
+                previous is not None
+                and previous_dexes.issubset(expected_key)
+                and not previous_dexes.issubset(perp_dexs)
+            ):
+                logger.error(
+                    "HIP-3 client rebuild would drop cached dexes %s; keeping previous client",
+                    previous_key,
+                )
+                _clients_degraded_at = _time.monotonic()
+                return previous
+            if previous is not None and tuple(perp_dexs) == previous_key:
+                _clients_degraded_at = _time.monotonic()
+                return previous
+
+            def _construct(dexes):
+                built_info = Info(
+                    api_url,
+                    skip_ws=True,
+                    spot_meta=spot_meta,
+                    perp_dexs=dexes,
+                )
+                built_info._follow_enabled_dexes = tuple(dexes)
+                meta = built_info.meta()
+                built_exchange = Exchange(
+                    wallet,
+                    api_url,
+                    meta=meta,
+                    account_address=main_address,
+                    spot_meta=spot_meta,
+                    perp_dexs=dexes,
+                )
+                return built_exchange, built_info
+
+            actual_dexes = perp_dexs
+            try:
+                exchange, info = _construct(perp_dexs)
+            except Exception as e:
+                if previous is not None:
+                    raise
+                if perp_dexs == [""]:
+                    raise
+                logger.error(
+                    "HIP-3 client degraded: failed to initialize dexes %s; retrying default dex only: %s",
+                    perp_dexs,
+                    e,
+                )
+                actual_dexes = [""]
+                exchange, info = _construct(actual_dexes)
+        except Exception as e:
+            if previous is None:
+                raise
+            logger.error(
+                "HIP-3 client rebuild failed; keeping cached dexes %s and retrying later: %s",
+                previous_key,
+                e,
+            )
+            _clients_degraded_at = _time.monotonic()
+            return previous
+
         _clients_cache = (exchange, info)
+        _clients_cache_key = tuple(actual_dexes)
+        _clients_degraded_at = (
+            _time.monotonic() if _clients_cache_key != expected_key else None
+        )
         return exchange, info
 
 
@@ -127,29 +255,112 @@ def fan_out(tasks: dict[str, Callable]) -> dict:
     return results
 
 
-def _get_positions(info: Info, address: str) -> tuple[float, float, dict]:
+def _coin_dex(coin: str) -> str:
+    """Return the builder dex prefix for a coin; default perps use an empty dex."""
+    return coin.split(":", 1)[0] if ":" in coin else ""
+
+
+def _dexes_for_coins(coins, *, include_default: bool = False) -> list[str]:
+    """Return stable, de-duplicated dex names needed for the given coins."""
+    dexes = {_coin_dex(str(coin)) for coin in (coins or []) if coin}
+    if include_default or not dexes:
+        dexes.add("")
+    return ([""] if "" in dexes else []) + sorted(dex for dex in dexes if dex)
+
+
+def _get_relevant_dexes(info: Info | None = None) -> list[str]:
+    """Return default plus dexes referenced by symbol mappings or persisted baselines."""
+    moss_cfg = cfg.get_moss_source_config()
+    symbol_map = moss_cfg.get("symbol_map", {})
+    mapped_coins = symbol_map.values() if isinstance(symbol_map, dict) else []
+    coins = [str(coin) for coin in mapped_coins if coin]
+    try:
+        coins.extend(db.get_all_baseline_coins())
+    except Exception as e:
+        logger.warning("Failed to read baseline coins for relevant dex selection: %s", e)
+    relevant_dexes = _dexes_for_coins(coins, include_default=True)
+    enabled_dexes = getattr(info, "__dict__", {}).get("_follow_enabled_dexes")
+    if enabled_dexes is None:
+        return relevant_dexes
+    enabled = set(_normalize_dexes(enabled_dexes))
+    return [dex for dex in relevant_dexes if dex in enabled]
+
+
+def _normalize_dexes(dexes) -> list[str]:
+    values = [dexes] if isinstance(dexes, str) else (dexes or [""])
+    normalized = {str(dex or "").strip() for dex in values}
+    return ([""] if "" in normalized else []) + sorted(
+        dex for dex in normalized if dex
+    )
+
+
+def _get_positions(
+    info: Info,
+    address: str,
+    *,
+    dexes=None,
+) -> tuple[float, float, dict, dict[str, float]]:
     """
     查询账户仓位信息。
-    Returns (account_value, withdrawable, positions)
+    Returns (summed_account_value, summed_withdrawable, positions, account_values_by_dex)
     positions: {coin: {"size": float, "entry_px": float, "leverage": int, "unrealized_pnl": float}}
     size > 0 = 多头，size < 0 = 空头
     """
-    state = info.user_state(address)
-    account_value = float(state.get("marginSummary", {}).get("accountValue", 0))
-    withdrawable = float(state.get("withdrawable", 0))
+    account_value, withdrawable, positions, account_values, _ = _get_positions_by_dex(
+        info, address, dexes=dexes
+    )
+    return account_value, withdrawable, positions, account_values
+
+
+def _get_positions_by_dex(
+    info: Info,
+    address: str,
+    *,
+    dexes=None,
+) -> tuple[float, float, dict, dict[str, float], dict[str, float]]:
+    """Like `_get_positions`, with per-DEX withdrawable values for risk checks."""
+    requested_dexes = _normalize_dexes(dexes)
+    account_value = 0.0
+    withdrawable = 0.0
     positions: dict = {}
-    for ap in state.get("assetPositions", []):
-        pos = ap.get("position", {})
-        coin = pos.get("coin")
-        szi = float(pos.get("szi", 0))
-        if coin and szi != 0:
-            positions[coin] = {
-                "size": szi,
-                "entry_px": float(pos.get("entryPx") or 0),
-                "leverage": int(pos.get("leverage", {}).get("value", 1)),
-                "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
-            }
-    return account_value, withdrawable, positions
+    account_values: dict[str, float] = {}
+    withdrawables: dict[str, float] = {}
+    for dex in requested_dexes:
+        state = info.user_state(address) if dex == "" else info.user_state(address, dex)
+        dex_account_value = float(state.get("marginSummary", {}).get("accountValue", 0))
+        dex_withdrawable = float(state.get("withdrawable", 0))
+        account_values[dex] = dex_account_value
+        withdrawables[dex] = dex_withdrawable
+        account_value += dex_account_value
+        withdrawable += dex_withdrawable
+        for ap in state.get("assetPositions", []):
+            pos = ap.get("position", {})
+            coin = pos.get("coin")
+            szi = float(pos.get("szi", 0))
+            if coin and szi != 0:
+                positions[coin] = {
+                    "size": szi,
+                    "entry_px": float(pos.get("entryPx") or 0),
+                    "leverage": int(pos.get("leverage", {}).get("value", 1)),
+                    "unrealized_pnl": float(pos.get("unrealizedPnl") or 0),
+                }
+    return account_value, withdrawable, positions, account_values, withdrawables
+
+
+def _get_mids(info: Info, coins=None) -> dict:
+    """Merge mids only for the default/HIP-3 dexes needed by `coins`."""
+    if coins is None:
+        dexes = [""]
+    else:
+        dexes = sorted({_coin_dex(coin) for coin in coins})
+        if "" in dexes:
+            dexes.remove("")
+            dexes.insert(0, "")
+
+    mids: dict = {}
+    for dex in dexes:
+        mids.update(info.all_mids(dex))
+    return mids
 
 
 def _round_price(px: float, sig_figs: int = 5) -> float:
@@ -173,21 +384,78 @@ def _get_sz_decimals(info: Info, coin: str) -> int:
     return info.asset_to_sz_decimals.get(asset, 4) if asset is not None else 4
 
 
+def _uses_cross_margin(info: Info, coin: str) -> bool:
+    """Return whether leverage updates should use cross margin for this market."""
+    dex = _coin_dex(coin)
+    if not dex:
+        return True
+
+    with _margin_mode_lock:
+        modes = getattr(info, "_follow_cross_margin", None)
+        if modes is None:
+            modes = {}
+            info._follow_cross_margin = modes
+        if coin in modes:
+            return bool(modes[coin])
+
+        try:
+            meta = info.meta(dex=dex)
+            for market in meta.get("universe", []) or []:
+                name = str(market.get("name") or "")
+                if not name:
+                    continue
+                modes[name] = not (
+                    bool(market.get("onlyIsolated"))
+                    or market.get("marginMode") == "noCross"
+                )
+        except Exception as e:
+            logger.warning(
+                "Failed to load margin mode for %s; using isolated margin: %s",
+                coin, e,
+            )
+
+        # Builder DEX markets default to isolated when metadata is unavailable.
+        return bool(modes.get(coin, False))
+
+
 def _is_coin_tradeable(info: Info, coin: str, source: str = "") -> bool:
     """Apply shared Hyperliquid supported perp coin filters before syncing or opening."""
     log_prefix = f"{source}: " if source else ""
     canonical_coin = hyper_coins.canonicalize_coin(coin, info=info)
     check_coin = canonical_coin or coin
 
-    if cfg.get("perp_only", True):
-        asset = info.coin_to_asset.get(check_coin)
-        if asset is None or asset >= 10000:
-            logger.info("%sSkipping non-perp coin: %s", log_prefix, check_coin)
-            return False
-
     if not canonical_coin:
         logger.info("%sSkipping coin not in Hyperliquid supported coin cache: %s", log_prefix, coin)
         return False
+
+    if cfg.get("perp_only", True):
+        dex = _coin_dex(check_coin)
+        asset = info.coin_to_asset.get(check_coin)
+        # Builder DEX coins are validated by the supported-perp cache, but are
+        # not always present in the default Perps asset map.
+        if not dex and (asset is None or 10000 <= asset < 100000):
+            logger.info("%sSkipping non-perp coin: %s", log_prefix, check_coin)
+            return False
+
+    moss_cfg = cfg.get_moss_source_config()
+    market_scope = str(moss_cfg.get("market_scope") or "")
+    if market_scope:
+        configured_agent = str(moss_cfg.get("agent_id") or "")
+        scope_agent = str(moss_cfg.get("market_scope_agent_id") or "")
+        if scope_agent and configured_agent and scope_agent != configured_agent:
+            logger.error(
+                "%sSkipping %s: market scope was validated for another Agent",
+                log_prefix, check_coin,
+            )
+            return False
+        dex = _coin_dex(check_coin)
+        expected_scope = "xyz" if dex == "xyz" else "default" if not dex else dex
+        if expected_scope != market_scope:
+            logger.error(
+                "%sSkipping %s: validated Agent scope=%s does not allow dex=%s",
+                log_prefix, check_coin, market_scope, dex or "default",
+            )
+            return False
 
     return True
 
@@ -228,13 +496,13 @@ def _place_order(
     if _leverage_cache.get(coin) != leverage:
         try:
             _lev_t0 = _time.time()
-            exchange.update_leverage(leverage, coin, is_cross=True)
+            is_cross = _uses_cross_margin(info, coin)
+            exchange.update_leverage(leverage, coin, is_cross=is_cross)
             logger.info("Leverage updated: coin=%s leverage=%sx (%.0fms)", coin, leverage, (_time.time() - _lev_t0) * 1000)
             _leverage_cache[coin] = leverage
         except Exception as e:
             logger.warning("Failed to update leverage for %s: %s", coin, e)
 
-    asset = info.coin_to_asset.get(coin)
     sz_decimals = _get_sz_decimals(info, coin)
     rounded_size = round(size, sz_decimals)
 
@@ -295,7 +563,7 @@ def _do_sync_coin(
     coin: str,
     agent_address: str,
     agent_acct_val: float,
-    our_acct_val: float,
+    our_acct_values: dict[str, float],
     agent_positions: dict,
     our_positions: dict,
     baselines: dict,
@@ -327,6 +595,8 @@ def _do_sync_coin(
         agent_positions = hyper_coins.canonicalize_positions(agent_positions, info=info)
         our_positions = hyper_coins.canonicalize_positions(our_positions, info=info)
         baselines = hyper_coins.canonicalize_positions(baselines, info=info)
+
+    our_acct_val = float(our_acct_values.get(_coin_dex(coin), 0.0))
 
     _t0_sync = _time.time()
     baseline = baselines.get(coin, {})
@@ -452,6 +722,17 @@ def _do_sync_coin(
         target_our_size = max(0.0, target_our_size)
     elif baseline_agent_size < 0:
         target_our_size = min(0.0, target_our_size)
+
+    if (
+        _coin_dex(coin)
+        and our_acct_val <= 0
+        and abs(target_our_size) > abs(current_our_size)
+    ):
+        logger.warning(
+            "HIP-3 dex %s has zero account value for %s; deposit collateral into that dex before opening or increasing positions",
+            _coin_dex(coin),
+            coin,
+        )
 
     # 统一按交易所精度舍入
     sz_decimals = _get_sz_decimals(info, coin)
@@ -601,8 +882,11 @@ def close_all_positions() -> list[dict]:
         return []
 
     exchange, info = _build_clients()
-    our_acct_val, _, our_positions = _get_positions(info, our_account)
-    mids = info.all_mids()
+    dexes = _get_relevant_dexes(info)
+    _, _, our_positions, our_acct_values = _get_positions(
+        info, our_account, dexes=dexes
+    )
+    mids = _get_mids(info, our_positions)
 
     if not our_positions:
         logger.info("close_all_positions: no positions to close")
@@ -612,6 +896,7 @@ def close_all_positions() -> list[dict]:
     slippage = cfg.get("slippage_percent", 1.5) / 100.0
 
     for coin, pos in our_positions.items():
+        our_acct_val = our_acct_values.get(_coin_dex(coin), 0.0)
         size = pos["size"]
         entry_px = pos.get("entry_px", 0.0)
         leverage = pos.get("leverage", 1)
@@ -710,10 +995,16 @@ def execute_delta_sync(
 
     try:
         exchange, info = _build_clients()
-        agent_acct_val, _, agent_positions = _get_positions(info, agent_address)
-        our_acct_val, _, our_positions = _get_positions(info, our_account)
+        dexes = _dexes_for_coins([coin])
+        _, _, agent_positions, agent_acct_values = _get_positions(
+            info, agent_address, dexes=dexes
+        )
+        _, _, our_positions, our_acct_values = _get_positions(
+            info, our_account, dexes=dexes
+        )
+        agent_acct_val = agent_acct_values.get(_coin_dex(coin), 0.0)
         baselines = db.get_baselines(agent_address)
-        mids = info.all_mids()
+        mids = _get_mids(info, [coin])
 
         if agent_acct_val <= 0:
             logger.warning("Agent account value=0, skipping delta sync for %s", coin)
@@ -725,7 +1016,7 @@ def execute_delta_sync(
             coin=coin,
             agent_address=agent_address,
             agent_acct_val=agent_acct_val,
-            our_acct_val=our_acct_val,
+            our_acct_values=our_acct_values,
             agent_positions=agent_positions,
             our_positions=our_positions,
             baselines=baselines,
@@ -763,7 +1054,10 @@ def check_sl_tp_periodic(agent_address: str, agent_positions: dict) -> None:
 
     try:
         exchange, info = _build_clients()
-        our_acct_val, _, our_positions = _get_positions(info, our_account)
+        dexes = _get_relevant_dexes(info)
+        _, _, our_positions, our_acct_values = _get_positions(
+            info, our_account, dexes=dexes
+        )
     except Exception as e:
         logger.exception("SL/TP periodic: client setup failed: %s", e)
         return
@@ -771,10 +1065,11 @@ def check_sl_tp_periodic(agent_address: str, agent_positions: dict) -> None:
     if not our_positions:
         return
 
-    mids = info.all_mids()
+    mids = _get_mids(info, our_positions)
     slippage = cfg.get("slippage_percent", 1.5) / 100.0
 
     for coin, pos in list(our_positions.items()):
+        our_acct_val = our_acct_values.get(_coin_dex(coin), 0.0)
         our_size = pos.get("size", 0.0)
         our_entry_px = pos.get("entry_px", 0.0)
         unrealized_pnl = pos.get("unrealized_pnl", 0.0)
@@ -889,18 +1184,22 @@ def sync_all_positions(agent_address: str, source: str = "align") -> None:
         return
 
     try:
-        exchange, info = _build_clients()
-        agent_acct_val, _, agent_positions = _get_positions(info, agent_address)
-        our_acct_val, _, our_positions = _get_positions(info, our_account)
         baselines = db.get_baselines(agent_address)
-        mids = info.all_mids()
-
+        exchange, info = _build_clients()
+        dexes = _dexes_for_coins(baselines, include_default=True)
+        agent_acct_val, _, agent_positions, agent_acct_values = _get_positions(
+            info, agent_address, dexes=dexes
+        )
+        _, _, our_positions, our_acct_values = _get_positions(
+            info, our_account, dexes=dexes
+        )
         if agent_acct_val <= 0:
             logger.warning("Agent account value=0, skipping sync_all_positions")
             return
 
         # 需要检查的币种集合：基线中有记录的 + Agent 当前持有的
         all_coins = set(baselines.keys()) | set(agent_positions.keys())
+        mids = _get_mids(info, all_coins)
 
         logger.info(
             "sync_all_positions [%s]: checking %d coins (baseline=%d agent_pos=%d)",
@@ -918,8 +1217,10 @@ def sync_all_positions(agent_address: str, source: str = "align") -> None:
                     info=info,
                     coin=coin,
                     agent_address=agent_address,
-                    agent_acct_val=agent_acct_val,
-                    our_acct_val=our_acct_val,
+                    agent_acct_val=agent_acct_values.get(
+                        _coin_dex(coin), agent_acct_val
+                    ),
+                    our_acct_values=our_acct_values,
                     agent_positions=agent_positions,
                     our_positions=our_positions,
                     baselines=baselines,
@@ -947,7 +1248,9 @@ def get_current_positions(address: str) -> dict:
     }
     """
     _, info = _build_clients()
-    account_value, withdrawable, positions = _get_positions(info, address)
+    account_value, withdrawable, positions, _ = _get_positions(
+        info, address, dexes=_get_relevant_dexes(info)
+    )
     return {
         "account_value": account_value,
         "withdrawable": withdrawable,

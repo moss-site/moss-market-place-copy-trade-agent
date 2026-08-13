@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,12 @@ logger = logging.getLogger("follow_agent.hyper_coins")
 
 CACHE_FILENAME = "hyper_supported_coins.json"
 DEFAULT_REFRESH_SECS = 600
+_REFRESH_FAILURE_COOLDOWN_SECS = 60.0
+_refresh_lock = threading.Lock()
+_last_refresh_attempt_at: float | None = None
+_last_refresh_attempt_key: tuple[str, str] | None = None
+_last_refresh_failed = False
+_refresh_generation = 0
 
 
 def get_cache_path() -> Path:
@@ -65,14 +72,92 @@ def _read_cache() -> dict[str, Any] | None:
 def _is_cache_fresh(data: dict[str, Any], api_url: str) -> bool:
     if data.get("api_url") != api_url:
         return False
+    if "perp_dexs" not in data:
+        return False
     try:
         fetched_at = float(data.get("fetched_at", 0))
     except (TypeError, ValueError):
         return False
-    return time.time() - fetched_at < _refresh_secs()
+    refresh_secs = _refresh_secs()
+    if data.get("failed_perp_dexs"):
+        refresh_secs = min(refresh_secs, int(_REFRESH_FAILURE_COOLDOWN_SECS))
+    return time.time() - fetched_at < refresh_secs
 
 
-def write_supported_coins(coins: list[str], *, api_url: str | None = None) -> dict[str, Any]:
+def _normalize_perp_dexs(raw_dexs: Any) -> list[str]:
+    """Normalize the perpDexs response to SDK dex names (default dex is "")."""
+    dexes: list[str] = []
+    for item in raw_dexs or []:
+        if item is None:
+            name = ""
+        elif isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item).strip()
+        if name not in dexes:
+            dexes.append(name)
+    if "" not in dexes:
+        dexes.insert(0, "")
+    elif dexes[0] != "":
+        dexes.remove("")
+        dexes.insert(0, "")
+    return dexes
+
+
+def _fetch_perp_dexs(info, api_url: str) -> list[str]:
+    if info is not None and hasattr(info, "perp_dexs"):
+        return _normalize_perp_dexs(info.perp_dexs())
+
+    if info is not None:
+        return [""]
+
+    r = requests.post(f"{api_url}/info", json={"type": "perpDexs"}, timeout=10)
+    r.raise_for_status()
+    return _normalize_perp_dexs(r.json())
+
+
+def _fetch_meta(info, api_url: str, dex: str) -> dict[str, Any]:
+    if info is not None and hasattr(info, "meta"):
+        try:
+            return info.meta(dex=dex)
+        except TypeError:
+            if dex == "":
+                return info.meta()
+            raise
+
+    body = {"type": "meta"}
+    if dex:
+        body["dex"] = dex
+    r = requests.post(f"{api_url}/info", json=body, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def _required_perp_dexs() -> set[str]:
+    """Return DEXes used by the current Agent baseline; default is always required."""
+    required = {""}
+    try:
+        from . import database as db
+
+        moss_cfg = cfg.get_moss_source_config()
+        agent_id = str(moss_cfg.get("agent_id") or "")
+        baselines = db.get_baselines(agent_id) if agent_id else {}
+        for coin in baselines:
+            value = str(coin or "")
+            if ":" in value:
+                required.add(value.split(":", 1)[0])
+    except Exception as e:
+        logger.debug("Failed to read required DEXes from baselines: %s", e)
+    return required
+
+
+def write_supported_coins(
+    coins: list[str],
+    *,
+    api_url: str | None = None,
+    perp_dexs: list[str] | None = None,
+    failed_perp_dexs: list[str] | None = None,
+) -> dict[str, Any]:
     """Atomically write the supported perp coin list cache."""
     normalized = []
     for coin in coins:
@@ -86,6 +171,8 @@ def write_supported_coins(coins: list[str], *, api_url: str | None = None) -> di
         "fetched_at": time.time(),
         "refresh_secs": _refresh_secs(),
         "coins": sorted(set(normalized)),
+        "perp_dexs": _normalize_perp_dexs(perp_dexs or [""]),
+        "failed_perp_dexs": sorted(set(failed_perp_dexs or [])),
     }
     path = get_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -96,33 +183,120 @@ def write_supported_coins(coins: list[str], *, api_url: str | None = None) -> di
     return payload
 
 
-def write_supported_coins_from_meta(meta: dict[str, Any], *, api_url: str | None = None) -> dict[str, Any]:
-    """Extract perp coins from Hyperliquid meta and write the cache."""
-    return write_supported_coins(_extract_perp_coins(meta), api_url=api_url)
-
-
 def refresh_supported_coins(info=None, *, force: bool = False) -> dict[str, Any]:
     """
     Refresh the local Hyperliquid supported coin cache.
 
-    If `info` is provided, reuse its `meta()` method; otherwise query the
-    Hyperliquid `/info` endpoint directly.
+    Enumerate perpDexs and merge the default and builder-deployed perp metas.
+    If `info` is provided, reuse its methods; otherwise query `/info` directly.
     """
+    global _last_refresh_attempt_at, _last_refresh_attempt_key
+    global _last_refresh_failed, _refresh_generation
+
+    observed_generation = _refresh_generation
+    with _refresh_lock:
+        api_url = _api_url()
+        attempt_key = (api_url, str(get_cache_path()))
+        cached = _read_cache()
+
+        def _fallback() -> dict[str, Any]:
+            if cached and cached.get("api_url") == api_url:
+                return cached
+            return {
+                "api_url": api_url,
+                "fetched_at": 0,
+                "refresh_secs": _refresh_secs(),
+                "coins": [],
+                "perp_dexs": [""],
+            }
+
+        # A caller that waited for another refresh shares that completed result.
+        if (
+            _refresh_generation != observed_generation
+            and _last_refresh_attempt_key == attempt_key
+        ):
+            return _fallback()
+
+        if cached and not force and _is_cache_fresh(cached, api_url):
+            return cached
+
+        now = time.monotonic()
+        if (
+            _last_refresh_failed
+            and _last_refresh_attempt_key == attempt_key
+            and _last_refresh_attempt_at is not None
+            and now - _last_refresh_attempt_at < _REFRESH_FAILURE_COOLDOWN_SECS
+        ):
+            return _fallback()
+
+        _last_refresh_attempt_at = now
+        _last_refresh_attempt_key = attempt_key
+        try:
+            discovered_dexs = _fetch_perp_dexs(info, api_url)
+            required_dexs = _required_perp_dexs()
+            missing_required = sorted(required_dexs - set(discovered_dexs))
+            if missing_required:
+                raise RuntimeError(
+                    f"required perp DEXes are unavailable: {missing_required}"
+                )
+
+            coins: list[str] = []
+            loaded_dexs: list[str] = []
+            failed_dexs: list[str] = []
+            for dex in discovered_dexs:
+                try:
+                    coins.extend(_extract_perp_coins(_fetch_meta(info, api_url, dex)))
+                    loaded_dexs.append(dex)
+                except Exception as e:
+                    if dex in required_dexs:
+                        raise RuntimeError(
+                            f"required perp DEX metadata unavailable for {dex or 'default'}"
+                        ) from e
+                    logger.warning(
+                        "Skipping unavailable non-required perp DEX metadata: dex=%s error=%s",
+                        dex, e,
+                    )
+                    failed_dexs.append(dex)
+
+            data = write_supported_coins(
+                coins,
+                api_url=api_url,
+                perp_dexs=loaded_dexs,
+                failed_perp_dexs=failed_dexs,
+            )
+        except Exception:
+            # Start the cooldown after the (potentially very slow) failed attempt
+            # completes, otherwise a 121s enumeration would immediately retry.
+            _last_refresh_attempt_at = time.monotonic()
+            _last_refresh_failed = True
+            _refresh_generation += 1
+            raise
+
+        _last_refresh_failed = False
+        _refresh_generation += 1
+        logger.info(
+            "Hyper coin cache refreshed: %d coins across %d perp dexes (failed=%s) -> %s",
+            len(data["coins"]), len(loaded_dexs), failed_dexs, get_cache_path(),
+        )
+        return data
+
+
+def get_perp_dexs(info=None) -> list[str]:
+    """Return cached SDK perp dex names, refreshing legacy/stale caches."""
     api_url = _api_url()
     cached = _read_cache()
-    if cached and not force and _is_cache_fresh(cached, api_url):
-        return cached
+    if cached and _is_cache_fresh(cached, api_url) and "perp_dexs" in cached:
+        return _normalize_perp_dexs(cached.get("perp_dexs"))
 
-    if info is not None and hasattr(info, "meta"):
-        meta = info.meta()
-    else:
-        r = requests.post(f"{api_url}/info", json={"type": "meta"}, timeout=10)
-        r.raise_for_status()
-        meta = r.json()
-
-    data = write_supported_coins_from_meta(meta, api_url=api_url)
-    logger.info("Hyper coin cache refreshed: %d coins -> %s", len(data["coins"]), get_cache_path())
-    return data
+    try:
+        data = refresh_supported_coins(info=info, force=True)
+        return _normalize_perp_dexs(data.get("perp_dexs"))
+    except Exception as e:
+        logger.warning("Failed to refresh Hyper perp dex cache: %s", e)
+        cached = _read_cache()
+        if cached and cached.get("api_url") == api_url and "perp_dexs" in cached:
+            return _normalize_perp_dexs(cached.get("perp_dexs"))
+        return [""]
 
 
 def get_supported_coins(info=None) -> set[str]:
