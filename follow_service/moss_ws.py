@@ -11,6 +11,8 @@ Moss Source Event WebSocket 消费模块
 """
 
 import asyncio
+import random
+import time
 import json
 import logging
 import threading
@@ -19,6 +21,8 @@ import time as _time
 import websockets
 
 from . import config as cfg
+from .infra import ReadError, retry_after_seconds
+from .task_health import update, wait
 from . import database as db
 from . import hyper_coins
 from .moss_client import MossClient
@@ -489,7 +493,9 @@ async def run_moss_ws(stop_event: asyncio.Event, baseline_lock: "threading.Lock 
 
     backoff = 5
     while not stop_event.is_set():
+        connected_at = None
         try:
+            update("moss_ws", "connecting")
             # Step 1: bootstrap 获取初始状态
             logger.info("Moss WS: fetching bootstrap for %s ...", agent_id)
             bootstrap = await loop.run_in_executor(None, moss_client.get_bootstrap)
@@ -520,16 +526,13 @@ async def run_moss_ws(stop_event: asyncio.Event, baseline_lock: "threading.Lock 
             ) as ws:
                 logger.info("Moss WS: connected, waiting for ready frame ...")
 
-                # 连接成功，重置退避
-                backoff = 5
-
                 # Step 4: 等待 ready 帧
-                raw_msg = await ws.recv()
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=30)
                 msg = json.loads(raw_msg)
 
                 if msg.get("type") != "ready":
                     logger.warning("Moss WS: expected ready frame, got: %s", msg.get("type"))
-                    continue
+                    raise RuntimeError("Moss WS missing ready frame")
 
                 subscribed_ids = msg.get("subscribed_source_account_ids", [])
                 logger.info(
@@ -537,6 +540,8 @@ async def run_moss_ws(stop_event: asyncio.Event, baseline_lock: "threading.Lock 
                     msg.get("server_time"), subscribed_ids,
                 )
 
+                connected_at = time.monotonic()
+                update("moss_ws", "ready", last_ready=time.time())
                 # Step 5: 消费事件流
                 async for raw_msg in ws:
                     if stop_event.is_set():
@@ -556,21 +561,32 @@ async def run_moss_ws(stop_event: asyncio.Event, baseline_lock: "threading.Lock 
                     await loop.run_in_executor(
                         None, _handle_source_event, event, agent_address, moss_client,
                     )
+                    update("moss_ws", "ready", last_event=time.time())
+                if not stop_event.is_set():
+                    raise ConnectionError("Moss WS stream ended")
 
         except asyncio.CancelledError:
             logger.info("Moss WS task cancelled, exiting ...")
             break
-        except (websockets.ConnectionClosed, OSError) as e:
-            if stop_event.is_set():
-                break
-            logger.warning("Moss WS connection lost (%s), reconnecting in %ds ...", e, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
         except Exception as e:
             if stop_event.is_set():
                 break
-            logger.exception("Moss WS error: %s, reconnecting in %ds ...", e, backoff)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 60)
+            response = getattr(e, "response", None)
+            status = getattr(response, "status_code", None)
+            if (isinstance(e, ReadError) and not e.transient) or status in {401, 403}:
+                update("moss_ws", "blocked", error="authorization rejected")
+                await stop_event.wait()
+                break
+            if connected_at is not None and time.monotonic() - connected_at >= 30:
+                backoff = 5
+            retry_after = max(getattr(e, "retry_after", 0),
+                              retry_after_seconds(getattr(response, "headers", {}).get("Retry-After")))
+            delay = max(retry_after, backoff + random.uniform(0, backoff * 0.2))
+            update("moss_ws", "retrying", error=type(e).__name__, retry_at=time.time() + delay)
+            logger.warning("Moss WS unavailable (%s); retrying in %.1fs", type(e).__name__, delay)
+            await wait(stop_event, delay)
+            backoff = min(backoff * 2, 300)
+
+    update("moss_ws", "stopped")
 
     logger.info("Moss WS consumer stopped.")

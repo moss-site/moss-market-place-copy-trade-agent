@@ -5,6 +5,7 @@
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from . import config as cfg
@@ -178,9 +179,13 @@ async def run_balance_tracker(stop_event: asyncio.Event, interval: int = 60) -> 
             try:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, _snapshot_balance)
+                from .task_health import update
+                update("balance", "healthy", last_success=time.time())
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                from .task_health import update
+                update("balance", "degraded", error=type(e).__name__)
                 logger.exception("Balance snapshot error: %s", e)
             for _ in range(interval):
                 if stop_event.is_set():

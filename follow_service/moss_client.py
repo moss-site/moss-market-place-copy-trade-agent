@@ -10,6 +10,8 @@ import time
 import urllib.parse
 
 import requests
+from . import config as cfg
+from .infra import request_json, cached_json
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
@@ -69,19 +71,14 @@ class MossClient:
         if params:
             url = f"{url}?{urllib.parse.urlencode(sorted(params.items()))}"
 
-        headers = self._follower_sign(method, full_path)
-
-        if body is not None:
-            headers["Content-Type"] = "application/json"
-            resp = self._session.request(
-                method, url, headers=headers,
-                data=json.dumps(body), timeout=10,
-            )
-        else:
-            resp = self._session.request(method, url, headers=headers, timeout=10)
-
-        resp.raise_for_status()
-        return resp.json()
+        def send(timeout):
+            headers = self._follower_sign(method, full_path)  # Renew signature on each read retry.
+            if body is not None:
+                headers["Content-Type"] = "application/json"
+            return self._session.request(method, url, headers=headers,
+                                         data=json.dumps(body) if body is not None else None,
+                                         timeout=timeout)
+        return request_json(send, "moss:" + full_path, attempts=4 if method == "GET" else 1)
 
     def _follower_request(self, method: str, path: str,
                           params: dict = None, body: dict = None) -> dict:
@@ -98,10 +95,22 @@ class MossClient:
     # ── Follower 注册 ────────────────────────────────────────────────────
 
     def register_follower(self) -> dict:
+        """Single-flight across CLI/WS/poller, cached for 60s per exact binding.
+
+        Store only public binding fields, never the signing request or response credentials.
+        Registration is idempotent; order/trade writes are not routed through this cache.
         """
-        注册为 follower（钱包签名验证）。
-        已注册地址重复调用直接返回现有记录。
-        """
+        key = json.dumps([self._base_url, self._wallet_address, self._main_address,
+                          self._builder_address, self._agent_id])
+        def fetch():
+            result = request_json(self._register_request, "moss:follower/register")
+            return {key: result.get(key) for key in
+                    ("follower_id", "status", "wallet_address", "main_address")}
+        return cached_json(cfg.get_config_path().parent / 'registration-cache', key, 60, fetch,
+                           lambda value: isinstance(value, dict) and value.get('status') == 'active'
+                           and isinstance(value.get('follower_id'), str) and value['follower_id'].startswith('flw_'))
+
+    def _register_request(self, timeout):
         ts = str(int(time.time()))
         message = (
             f"Moss Follower Register\n"
@@ -123,10 +132,7 @@ class MossClient:
 
         url = f"{self._base_url}{_FOLLOWER_PREFIX}/register"
         headers = {"Content-Type": "application/json"}
-        resp = self._session.post(url, headers=headers,
-                                  data=json.dumps(body), timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return self._session.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
 
     # ── 查询接口（follower 鉴权）─────────────────────────────────────────
 
@@ -176,9 +182,7 @@ class MossClient:
     def get_agent_info(self) -> dict:
         """查询 Agent 元数据（公开 API，无需签名）。"""
         url = f"{self._base_url}/api/v2/moss/trader/realtime/bots/{self._agent_id}"
-        resp = self._session.get(url, timeout=10)
-        resp.raise_for_status()
-        return resp.json()
+        return request_json(lambda timeout: self._session.get(url, timeout=timeout), "moss:agent-info")
 
     # ── Copy Trading 写接口 ────────────────────────────────────────────────
 

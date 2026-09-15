@@ -11,7 +11,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import requests
 
 from . import config as cfg
 
@@ -40,7 +39,7 @@ def _refresh_secs() -> int:
 
 
 def _api_url() -> str:
-    return cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+    return cfg.get_info_url()
 
 
 def _extract_perp_coins(meta: dict[str, Any]) -> list[str]:
@@ -111,9 +110,8 @@ def _fetch_perp_dexs(info, api_url: str) -> list[str]:
     if info is not None:
         return [""]
 
-    r = requests.post(f"{api_url}/info", json={"type": "perpDexs"}, timeout=10)
-    r.raise_for_status()
-    return _normalize_perp_dexs(r.json())
+    from .infra import post_info
+    return _normalize_perp_dexs(post_info(api_url, {"type": "perpDexs"}))
 
 
 def _fetch_meta(info, api_url: str, dex: str) -> dict[str, Any]:
@@ -128,9 +126,8 @@ def _fetch_meta(info, api_url: str, dex: str) -> dict[str, Any]:
     body = {"type": "meta"}
     if dex:
         body["dex"] = dex
-    r = requests.post(f"{api_url}/info", json=body, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    from .infra import post_info
+    return post_info(api_url, body)
 
 
 def _required_perp_dexs() -> set[str]:

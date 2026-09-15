@@ -100,5 +100,7 @@
   },
   "hyperliquid_auth": {
     "mode": "standard"
-  }
+  },
+  "hl_info_url": "",
+  "hyper_metadata_cache_dir": ""
 }
