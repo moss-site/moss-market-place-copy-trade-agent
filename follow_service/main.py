@@ -31,6 +31,7 @@ from .agent_protocol_reporter import run_agent_protocol_reporter
 from .balance_tracker import run_balance_tracker, run_sltp_checker
 from .hyper_coins import run_hyper_coin_refresher
 from .moss_poller import run_moss_poller
+from .task_health import supervise, update as update_task_health
 from .moss_reporter import run_moss_reporter
 from .moss_ws import run_moss_ws
 from .preflight import check_account_abstraction, check_authorization
@@ -182,7 +183,7 @@ def cmd_start() -> None:
         sys.exit(1)
 
     try:
-        coin_cache = hyper_coins.refresh_supported_coins(force=True)
+        coin_cache = hyper_coins.refresh_supported_coins(force=False)
         if not coin_cache.get("coins"):
             raise RuntimeError("empty Hyperliquid supported coin list")
     except Exception as e:
@@ -323,10 +324,23 @@ def cmd_run() -> None:
             baseline_lock = threading.Lock()  # 防止两通道重复初始化基线
             coros.append(run_moss_reporter(stop_event))                # 写接口: heartbeat + trades batch
             coros.append(run_moss_ws(stop_event, baseline_lock))       # 主通道: WebSocket 实时事件
-            coros.append(run_moss_poller(stop_event, baseline_lock))    # 补充通道: REST 轮询兜底
+            coros.append(supervise(
+                "moss_poller", lambda: run_moss_poller(stop_event, baseline_lock), stop_event,
+            ))  # REST fallback: recover transient startup failure without restarting trading.
+
+        def observe_task(task, name):
+            if stop_event.is_set() or task.cancelled():
+                return
+            error = task.exception()
+            if error is not None:
+                update_task_health(name, "blocked", error=type(error).__name__)
+                logger.error("Background task %s exited: %s", name, type(error).__name__)
 
         for c in coros:
-            _running_tasks.append(asyncio.create_task(c))
+            name = c.cr_code.co_name
+            task = asyncio.create_task(c, name=name)
+            task.add_done_callback(lambda task, name=name: observe_task(task, name))
+            _running_tasks.append(task)
 
         await asyncio.gather(*_running_tasks, return_exceptions=True)
 

@@ -14,16 +14,15 @@ import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
-import requests as _requests
 from eth_account import Account
 from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
 from hyperliquid.utils.constants import MAINNET_API_URL
 from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
 
 from . import config as cfg
 from . import database as db
 from . import hyper_coins
+from .infra import ReadInfo as Info, post_info
 
 logger = logging.getLogger("follow_agent.trader")
 
@@ -92,9 +91,7 @@ def _get_coin_lock(coin: str) -> threading.Lock:
 
 def _fetch_clean_spot_meta(api_url: str) -> dict:
     """获取 spot_meta 并过滤掉 token 索引越界的 universe 条目（测试网已知问题）。"""
-    r = _requests.post(f"{api_url}/info", json={"type": "spotMeta"}, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    data = post_info(cfg.get_info_url(), {"type": "spotMeta"})
     token_count = len(data["tokens"])
     data["universe"] = [
         u for u in data["universe"]
@@ -147,6 +144,8 @@ def _build_clients() -> tuple[Exchange, Info]:
             if not private_key:
                 raise ValueError("private_key is not configured")
             api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+            if api_url not in {"https://api.hyperliquid.xyz", "https://api.hyperliquid-testnet.xyz"}:
+                raise ValueError("hl_api_url must remain official for correct signing; use hl_info_url for reads")
             main_address = cfg.get("main_address") or None
 
             wallet = Account.from_key(private_key)
@@ -183,7 +182,7 @@ def _build_clients() -> tuple[Exchange, Info]:
 
             def _construct(dexes):
                 built_info = Info(
-                    api_url,
+                    cfg.get_info_url(),
                     skip_ws=True,
                     spot_meta=spot_meta,
                     perp_dexs=dexes,
@@ -196,8 +195,10 @@ def _build_clients() -> tuple[Exchange, Info]:
                     meta=meta,
                     account_address=main_address,
                     spot_meta=spot_meta,
-                    perp_dexs=dexes,
+                    perp_dexs=None,  # Avoid SDK constructing a second network-reading Info.
+                    timeout=10,
                 )
+                built_exchange.info = built_info
                 return built_exchange, built_info
 
             actual_dexes = perp_dexs

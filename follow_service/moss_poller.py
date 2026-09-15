@@ -12,6 +12,7 @@ Moss 信号源轮询模块
 import asyncio
 import json
 import logging
+import random
 import threading
 import time as _time
 
@@ -623,7 +624,7 @@ async def run_moss_poller(stop_event: asyncio.Event, baseline_lock: "threading.L
         logger.info("Follower registered: %s", result.get("follower_id", "?"))
     except Exception as e:
         logger.error("Follower registration failed: %s", e)
-        return
+        raise
 
     logger.info("Moss poller starting: agent_id=%s poll_interval=%ds", agent_id, poll_interval)
 
@@ -632,7 +633,7 @@ async def run_moss_poller(stop_event: asyncio.Event, baseline_lock: "threading.L
         await loop.run_in_executor(None, _init_moss_baseline, moss_client, agent_address, baseline_lock)
     except Exception as e:
         logger.exception("Moss baseline init failed: %s", e)
-        return
+        raise
 
     # 重启恢复：先补处理上次已落库但未完成 delta sync 的 fill，避免 pending 永久孤立。
     try:
@@ -673,6 +674,8 @@ async def run_moss_poller(stop_event: asyncio.Event, baseline_lock: "threading.L
                 agent_address,
             )
 
+            from .task_health import update
+            update("moss_poller", "healthy", last_success=_time.time())
             # 成功后重置退避
             backoff = poll_interval
 
@@ -682,11 +685,16 @@ async def run_moss_poller(stop_event: asyncio.Event, baseline_lock: "threading.L
         except Exception as e:
             logger.exception("Moss poll error: %s", e)
             # 指数退避：5 → 10 → 20 → 40 → max 60
-            backoff = min(backoff * 2, 60)
+            from .infra import ReadError
+            from .task_health import update
+            if isinstance(e, ReadError) and not e.transient:
+                raise
+            backoff = max(getattr(e, "retry_after", 0), min(backoff * 2, 300))
+            update("moss_poller", "degraded", retry_at=_time.time() + backoff)
             logger.info("Moss poll backoff: %ds", backoff)
 
         try:
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(backoff + random.uniform(0, min(5, backoff * 0.1)))
         except asyncio.CancelledError:
             logger.info("Moss poller task cancelled during sleep, exiting ...")
             break

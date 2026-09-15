@@ -24,11 +24,8 @@ _ACCOUNT_ABSTRACTION_LABELS = {
 
 
 def _post_info(api_url: str, payload: dict) -> list | dict | str:
-    import requests
-
-    r = requests.post(f"{api_url}/info", json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    from .infra import post_info
+    return post_info(cfg.get_info_url(), payload)
 
 
 def _is_evm_address(value: str) -> bool:
@@ -114,7 +111,11 @@ def _normalize_account_abstraction(response: object) -> str:
         )
     else:
         mode = None
-    return mode if mode in _ACCOUNT_ABSTRACTION_LABELS else "disabled"
+    if mode in {"disabled", "default"}:
+        return "disabled"
+    if mode in _ACCOUNT_ABSTRACTION_LABELS:
+        return mode
+    raise ValueError("unknown or malformed account mode; do not assume manual mode")
 
 
 def get_account_abstraction() -> str:
@@ -131,7 +132,7 @@ def get_account_abstraction() -> str:
 
 
 def check_account_abstraction(raise_on_fail: bool = True) -> bool:
-    """阻断统一账户/投资组合保证金模式；查询异常仅 warning 并放行。"""
+    """Block unsupported or unreadable account modes; never infer safety on 429."""
     account = (cfg.get("main_address", "") or cfg.get("wallet_address", "")).lower()
     if not account:
         logger.warning("账户地址未配置，跳过账户模式查询")
@@ -140,8 +141,10 @@ def check_account_abstraction(raise_on_fail: bool = True) -> bool:
     try:
         mode = get_account_abstraction()
     except Exception as e:
-        logger.warning("账户模式查询失败，按手动(标准)模式继续启动: %s", e)
-        return True
+        logger.error("账户模式查询失败，拒绝继续启动: %s", e)
+        if raise_on_fail:
+            raise RuntimeError("account mode unavailable; retry after recovery") from e
+        return False
 
     label = _ACCOUNT_ABSTRACTION_LABELS.get(mode)
     if label:

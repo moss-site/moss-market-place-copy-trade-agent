@@ -299,3 +299,15 @@ def ensure_dirs() -> None:
     Path(cfg["log_dir"]).expanduser().mkdir(parents=True, exist_ok=True)
     Path(cfg["db_path"]).expanduser().parent.mkdir(parents=True, exist_ok=True)
     Path(cfg["pid_file"]).expanduser().parent.mkdir(parents=True, exist_ok=True)
+
+
+def get_info_url() -> str:
+    """Optional read-only base URL, independent of network/signing hl_api_url."""
+    value = str(get("hl_info_url") or get("hl_api_url", "https://api.hyperliquid-testnet.xyz")).rstrip("/")
+    from urllib.parse import urlsplit
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc or parsed.query or parsed.fragment:
+        raise ValueError("hl_info_url must be an HTTP(S) base URL, not a query or fragment")
+    if parsed.path.endswith(("/info", "/hypercore")):
+        raise ValueError("hl_info_url must be the native /info base URL, not /info or /hypercore")
+    return value

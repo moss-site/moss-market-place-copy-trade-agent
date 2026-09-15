@@ -301,3 +301,7 @@ If startup fails, first verify the configured network, confirm that the private 
 - `service pause` submits closing orders; network congestion, slippage, or insufficient liquidity can prevent complete execution
 
 For the complete agent conversation rules, authorization gates, and operational workflow, see [`SKILL.md`](SKILL.md).
+
+### Infrastructure resilience
+
+See [read-only provider configuration, retry/cache behavior, tests and rollout](docs/infra-resilience.md).
