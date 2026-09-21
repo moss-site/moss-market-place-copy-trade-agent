@@ -249,10 +249,11 @@ def _init_baseline_from_bootstrap(
 
             is_buy = our_gap > 0
             order_price = _round_price(
-                current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
+                current_price * (1 + slippage) if is_buy else current_price * (1 - slippage),
+                info, coin, is_buy,
             )
 
-            oid, filled_price, fee, actual_size = _place_order(
+            oid, filled_price, fee, actual_size, error_msg = _place_order(
                 exchange, info, coin, is_buy, abs(our_gap), order_price, agent_leverage,
             )
 
@@ -279,6 +280,7 @@ def _init_baseline_from_bootstrap(
                 fee=fee,
                 leverage=agent_leverage,
                 our_order_id=oid,
+                error_msg=error_msg,
                 baseline_agent_size=agent_size,
                 agent_pos_before=agent_size,
                 agent_delta=0.0,

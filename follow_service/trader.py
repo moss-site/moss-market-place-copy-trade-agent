@@ -8,10 +8,10 @@
 """
 
 import logging
-import math
 import threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Callable, Optional
 
 from eth_account import Account
@@ -364,13 +364,26 @@ def _get_mids(info: Info, coins=None) -> dict:
     return mids
 
 
-def _round_price(px: float, sig_figs: int = 5) -> float:
-    """将价格四舍五入到 Hyperliquid 的 5 位有效数字精度规则。"""
-    if px <= 0:
-        return px
-    magnitude = math.floor(math.log10(px))
-    factor = 10 ** (sig_figs - 1 - magnitude)
-    return round(px * factor) / factor
+def _round_price(px: float, info: Info, coin: str, is_buy: bool) -> float:
+    """合法限价：5 位有效数字 + 市场小数上限，且不扩大原滑点范围。"""
+    price = Decimal(str(px))
+    if not price.is_finite() or price <= 0:
+        raise ValueError("Order price must be finite and positive")
+    asset = info.coin_to_asset.get(coin)
+    if type(asset) is not int or asset < 0:
+        raise ValueError(f"Missing asset metadata for {coin}")
+    # Spot uses [10000, 100000); HIP-3 asset IDs >= 100000 are still perps.
+    max_decimals = 8 if 10000 <= asset < 100000 else 6
+    sz_decimals = info.asset_to_sz_decimals.get(asset)
+    if type(sz_decimals) is not int or not 0 <= sz_decimals <= max_decimals:
+        raise ValueError(f"Missing or invalid szDecimals for {coin}")
+    # Integer prices remain valid even with more than 5 significant figures.
+    decimals = min(max_decimals - sz_decimals, max(0, 4 - price.adjusted()))
+    tick = Decimal(1).scaleb(-decimals)
+    rounded = price.quantize(tick, rounding=ROUND_FLOOR if is_buy else ROUND_CEILING)
+    if rounded <= 0:
+        raise ValueError(f"Order price rounds to zero for {coin}")
+    return float(rounded)
 
 
 def _trade_notional(size: float, order_price: float | None = None, filled_price: float | None = None) -> float:
@@ -488,11 +501,19 @@ def _place_order(
     order_price: float,
     leverage: int,
     force: bool = False,
-) -> tuple[Optional[str], Optional[float], Optional[float], float]:
+) -> tuple[Optional[str], Optional[float], Optional[float], float, Optional[str]]:
     """
     以 IOC 限价单下单。
-    Returns (order_id, filled_price, fee, rounded_size)；失败返回 (None, None, None, 0.0)。
+    Returns (order_id, filled_price, fee, rounded_size, error_msg)。
+    错误原因随结果传递；网络异常继续向上抛出，调用内不自动重发下单。
     """
+    # Defensive normalization before any write; callers use the same helper so
+    # their trade records also contain the actual submitted limit price.
+    try:
+        order_price = _round_price(order_price, info, coin, is_buy)
+    except ValueError as exc:
+        logger.warning("Invalid order price for %s: %s", coin, exc)
+        return None, None, None, 0.0, str(exc)
     # 更新杠杆（有缓存避免重复调用）
     if _leverage_cache.get(coin) != leverage:
         try:
@@ -509,7 +530,7 @@ def _place_order(
 
     if rounded_size <= 0:
         logger.warning("Rounded size=0 for %s, skipping", coin)
-        return None, None, None, 0.0
+        return None, None, None, 0.0, "Rounded order size is zero"
 
     order_value = rounded_size * order_price
     if order_value < _MIN_ORDER_USD and not force:
@@ -517,7 +538,7 @@ def _place_order(
             "Order value $%.2f below minimum $%.2f for %s (size=%.6f price=%.4f), skipping",
             order_value, _MIN_ORDER_USD, coin, rounded_size, order_price,
         )
-        return None, None, None, 0.0
+        return None, None, None, 0.0, f"Order value ${order_value:.2f} below minimum ${_MIN_ORDER_USD:.2f}"
 
     builder = None
     if cfg.is_builder_fee_enabled():
@@ -538,22 +559,24 @@ def _place_order(
             first = statuses[0]
             if "error" in first:
                 logger.error("Order error for %s: %s", coin, first["error"])
-                return None, None, None, 0.0
+                return None, None, None, 0.0, str(first["error"]) or "Exchange rejected order"
             if "filled" in first:
                 oid = str(first["filled"].get("oid", ""))
                 filled_price = float(first["filled"].get("avgPx", order_price))
                 fee = float(first["filled"].get("totalRawFeeUsdc", 0))
-                return oid or None, filled_price, fee, rounded_size
+                return oid or None, filled_price, fee, rounded_size, None if oid else "Filled response missing order ID"
             if "resting" in first:
                 oid = str(first["resting"].get("oid", ""))
                 logger.warning("IOC order resting for %s (oid=%s), treating as rejected", coin, oid)
-                return None, None, None, 0.0
+                return None, None, None, 0.0, f"IOC order unexpectedly resting (oid={oid}); reconcile order state"
             logger.warning("Unexpected status for %s: %s", coin, first)
-            return None, None, None, 0.0
+            return None, None, None, 0.0, "Unexpected exchange order status; reconcile order state"
     else:
         logger.error("Order failed for %s: %s", coin, result)
+        reason = result.get("response")
+        return None, None, None, 0.0, reason if isinstance(reason, str) and reason else "Exchange rejected order"
 
-    return None, None, None, 0.0
+    return None, None, None, 0.0, "Exchange response missing order status; reconcile order state"
 
 
 # ── 核心 delta 对齐逻辑 ───────────────────────────────────────────────────────
@@ -662,8 +685,11 @@ def _do_sync_coin(
             is_buy = current_our_size < 0
             close_size = abs(current_our_size)
             slippage = cfg.get("slippage_percent", 1.5) / 100.0
-            close_price = _round_price(ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage))
-            oid, filled_price, fee, actual_size = _place_order(exchange, info, coin, is_buy, close_size, close_price, agent_leverage, force=True)
+            close_price = _round_price(
+                ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage),
+                info, coin, is_buy,
+            )
+            oid, filled_price, fee, actual_size, error_msg = _place_order(exchange, info, coin, is_buy, close_size, close_price, agent_leverage, force=True)
 
             # 计算已实现盈亏
             realized_pnl = None
@@ -692,6 +718,7 @@ def _do_sync_coin(
                 fee=fee,
                 leverage=agent_leverage,
                 our_order_id=oid,
+                error_msg=error_msg,
                 baseline_agent_size=baseline_agent_size,
                 agent_pos_before=current_agent_size,
                 agent_delta=agent_delta,
@@ -791,7 +818,10 @@ def _do_sync_coin(
     order_size = abs(our_gap)
 
     slippage = cfg.get("slippage_percent", 1.5) / 100.0
-    order_price = _round_price(ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage))
+    order_price = _round_price(
+        ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage),
+        info, coin, is_buy,
+    )
 
     logger.info(
         "Delta sync [%s]: %s %s size=%.6f price=%.4f ref=%.4f "
@@ -803,7 +833,7 @@ def _do_sync_coin(
     )
 
     _t_before_order = _time.time()
-    oid, filled_price, fee, actual_size = _place_order(
+    oid, filled_price, fee, actual_size, error_msg = _place_order(
         exchange, info, coin, is_buy, order_size, order_price, agent_leverage,
         force=force_close,
     )
@@ -846,6 +876,7 @@ def _do_sync_coin(
         agent_fill_tid=agent_fill_tid,
         agent_event_id=agent_event_id,
         our_order_id=oid,
+        error_msg=error_msg,
         baseline_agent_size=baseline_agent_size,
         agent_pos_before=current_agent_size,
         agent_delta=agent_delta,
@@ -908,14 +939,17 @@ def close_all_positions() -> list[dict]:
 
         is_buy = size < 0  # 空头需买入平仓，多头需卖出平仓
         close_size = abs(size)
-        close_price = _round_price(ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage))
+        close_price = _round_price(
+            ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage),
+            info, coin, is_buy,
+        )
 
         logger.info(
             "close_all_positions: closing %s %s size=%.6f price=%.4f",
             coin, "buy" if is_buy else "sell", close_size, close_price,
         )
 
-        oid, filled_price, fee, actual_size = _place_order(exchange, info, coin, is_buy, close_size, close_price, leverage)
+        oid, filled_price, fee, actual_size, error_msg = _place_order(exchange, info, coin, is_buy, close_size, close_price, leverage)
 
         realized_pnl = None
         if oid and filled_price and entry_px:
@@ -954,6 +988,7 @@ def close_all_positions() -> list[dict]:
             fee=fee,
             leverage=leverage,
             our_order_id=oid,
+            error_msg=error_msg,
             our_pos_before=size,
             our_pos_after=0.0 if oid else size,
             our_account_value=our_acct_val,
@@ -1111,9 +1146,10 @@ def check_sl_tp_periodic(agent_address: str, agent_positions: dict) -> None:
             is_buy = our_size < 0
             close_size = abs(our_size)
             close_price = _round_price(
-                ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage)
+                ref_price * (1 + slippage) if is_buy else ref_price * (1 - slippage),
+                info, coin, is_buy,
             )
-            oid, filled_price, fee, actual_size = _place_order(
+            oid, filled_price, fee, actual_size, error_msg = _place_order(
                 exchange, info, coin, is_buy, close_size, close_price, leverage, force=True,
             )
 
@@ -1149,6 +1185,7 @@ def check_sl_tp_periodic(agent_address: str, agent_positions: dict) -> None:
                 leverage=leverage,
                 symbol=agent_positions.get(coin, {}).get("symbol"),
                 our_order_id=oid,
+                error_msg=error_msg,
                 our_pos_before=our_size,
                 our_pos_after=our_pos_after,
                 our_account_value=our_acct_val,
